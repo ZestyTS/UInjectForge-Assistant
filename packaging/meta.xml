@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>UInjectForge Assistant</name>
+  <coder>ZestyTS</coder>
+  <version>1.0.0-alpha</version>
+  <short_description>Wii U companion for UInjectForge</short_description>
+  <long_description>Receive and validate builds, review console setup, and install selected packages.</long_description>
+</app>

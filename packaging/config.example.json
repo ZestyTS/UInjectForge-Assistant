@@ -1,0 +1,11 @@
+{
+  "httpPort": 8573,
+  "broadcastEnabled": true,
+  "passiveBroadcastEnabled": false,
+  "broadcastPort": 8573,
+  "simpleUi": true,
+  "uiMode": "simple",
+  "installEnabled": true,
+  "manualInstallEnabled": true,
+  "autoInstallEnabled": false
+}

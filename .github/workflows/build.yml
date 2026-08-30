@@ -1,0 +1,40 @@
+name: Wii U build
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build SDK image
+        run: docker build -t component-builder .
+      - name: Compile
+        run: docker run --rm --network none -e GITHUB_SHA -v "$PWD:/project" -w /project component-builder make -j2 UIF_COMPONENT_BUILD_ID="$GITHUB_SHA"
+      - name: Host checks
+        run: |
+          docker build -f tests/Dockerfile.host -t component-tests .
+          docker run --rm --network none -v "$PWD:/app" -w /app component-tests make host-test ui-host-test
+      - name: Record source and toolchain
+        run: |
+          git rev-parse HEAD > BUILD-COMMIT.txt
+          docker image inspect component-builder > BUILD-TOOLCHAIN.json
+          sha256sum *.rpx *.wuhb > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UInjectForge-Assistant-build
+          if-no-files-found: error
+          path: |
+            *.rpx
+            *.wuhb
+            BUILD-COMMIT.txt
+            BUILD-TOOLCHAIN.json
+            SHA256SUMS.txt
+            LICENSE*
+            THIRD-PARTY-NOTICES.md
+            licenses/
