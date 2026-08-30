@@ -1,4 +1,3 @@
-FROM wiiuenv/devkitppc:20220907
-
+FROM wiiuenv/devkitppc:20220907@sha256:89c103af512364934da0cbd816e8f570a4fea159a436cf6d06a5714473c87310
 WORKDIR /app
 CMD ["make", "-j2"]
