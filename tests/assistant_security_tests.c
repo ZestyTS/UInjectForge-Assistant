@@ -1,7 +1,9 @@
 #include "assistant_security.h"
+#include "assistant_paths.h"
 
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 
 static void test_constant_time_compare(void)
 {
@@ -40,11 +42,22 @@ static void test_install_permissions(void)
     assert(!killed.automatic_enabled);
 }
 
+static void test_directory_creation_offsets(void)
+{
+    assert(assistant_directory_creation_offset("/vol/external01/uinjectforge/assistant") == strlen("/vol/external01/"));
+    assert(assistant_directory_creation_offset("/vol/external01") == strlen("/vol/external01"));
+    assert(assistant_directory_creation_offset("fs:/vol/storage_mlc01/usr/title") == strlen("fs:/vol/storage_mlc01/"));
+    assert(assistant_directory_creation_offset("sd:/uinjectforge") == strlen("sd:/"));
+    assert(assistant_directory_creation_offset("/tmp/uinjectforge") == 1);
+    assert(assistant_directory_creation_offset("relative/path") == 0);
+}
+
 int main(void)
 {
     test_constant_time_compare();
     test_pairing_backoff();
     test_install_permissions();
+    test_directory_creation_offsets();
     puts("Assistant native security tests passed.");
     return 0;
 }

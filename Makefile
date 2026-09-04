@@ -55,7 +55,7 @@ ui-host-test:
 
 host-test:
 	@mkdir -p $(HOST_TEST_BUILD)
-	@$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iinclude source/assistant_security.c tests/assistant_security_tests.c -o $(HOST_TEST_BUILD)/assistant-security-tests
+	@$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iinclude source/assistant_security.c source/assistant_paths.c tests/assistant_security_tests.c -o $(HOST_TEST_BUILD)/assistant-security-tests
 	@$(HOST_TEST_BUILD)/assistant-security-tests
 
 ifneq ($(BUILD),$(notdir $(CURDIR)))

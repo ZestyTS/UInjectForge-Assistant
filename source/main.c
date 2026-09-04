@@ -39,6 +39,7 @@
 #include <whb/sdcard.h>
 
 #include "assistant_ui.h"
+#include "assistant_paths.h"
 #include "assistant_security.h"
 #include "assistant_telemetry.h"
 #include "assistant_storage.h"
@@ -1099,12 +1100,12 @@ static bool mkdir_recursive(const char *path)
     char current[UIF_MAX_PATH];
     copy_text(current, sizeof(current), path);
 
-    char *cursor = current;
-    char *device_separator = strstr(current, ":/");
-    if (device_separator)
-        cursor = device_separator + 2;
-    else if (*cursor == '/')
-        cursor++;
+    size_t current_length = strlen(current);
+    size_t creation_offset = assistant_directory_creation_offset(current);
+    if (creation_offset >= current_length)
+        return path_is_directory(current);
+
+    char *cursor = current + creation_offset;
 
     for (; *cursor; cursor++)
     {
@@ -5115,6 +5116,14 @@ static bool initialize_services(AssistantState *state)
     load_assistant_config(state);
     set_status(state, "Checking interrupted transfers.");
     recover_assistant_storage(state);
+
+    char incoming_root[UIF_MAX_PATH];
+    if (!join_path_checked(incoming_root, sizeof(incoming_root), state->sd_root, "uinjectforge/assistant/incoming")
+        || !mkdir_recursive(incoming_root))
+    {
+        set_status(state, "Assistant could not prepare SD transfer storage. Check the SD card and relaunch.");
+        return false;
+    }
 
     set_status(state, "Initializing network.");
     ACInitialize();
