@@ -16,7 +16,8 @@ Allow local network access through your firewall; do not expose this port
 to the Internet.
 
 Manual installation requires on-console confirmation. Automatic installation
-is off by default and must be explicitly enabled in the receiver configuration.
+is off by default; press X or tap Auto install in Assistant, then confirm to
+enable it. UIF still requires Copy and install for each transfer.
 Do not remove storage or power off the console while installing.
 
 ## Status

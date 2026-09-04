@@ -48,11 +48,14 @@ int selectedInstalledTitleIndex = 0;
 int selectedInstallTarget = 1;
 bool installConfirmOpen = false;
 bool launchConfirmOpen = false;
+bool autoInstallConfirmOpen = false;
 bool contentFocused = false;
 bool installActive = false;
 bool simpleUi = false;
 bool touchHeld = false;
 bool cachedInstallEnabled = false;
+bool cachedInstallGloballyEnabled = false;
+bool cachedAutoInstallEnabled = false;
 bool packagesLoaded = false;
 bool setupLoaded = false;
 bool titleCatalogAvailable = false;
@@ -144,10 +147,11 @@ const char *PageNames[] = {
 constexpr int PageCount = sizeof(PageNames) / sizeof(PageNames[0]);
 constexpr int PackagesPageIndex = 6;
 constexpr int InstalledTitlesPageIndex = 8;
+constexpr int ConfigPageIndex = 14;
 constexpr int SidebarVisibleCount = 8;
 int sidebarStart = 0;
 
-enum class TouchCommand { Page, SidebarUp, SidebarDown, Enter, Back, Refresh, Package, Title, Previous, Next, Confirm, Nand, Usb };
+enum class TouchCommand { Page, SidebarUp, SidebarDown, Enter, Back, Refresh, Package, Title, Previous, Next, Confirm, Nand, Usb, AutoInstall };
 struct TouchTarget { SDL_Rect rect; TouchCommand command; int value; };
 std::vector<TouchTarget> touchTargets;
 TouchTarget pressedTouch{};
@@ -1666,6 +1670,35 @@ void draw_confirmation()
     draw_button(installConfirmOpen ? "Install" : "Launch", 1340, 738, 310, TouchCommand::Confirm, 0, true);
 }
 
+void draw_auto_install_confirmation()
+{
+    touchTargets.clear();
+    const bool enabling = !cachedAutoInstallEnabled;
+    draw_panel(610, 282, 1120, 580, Accent);
+    draw_text(enabling ? "Enable automatic installs?" : "Disable automatic installs?", 654, 326, 42, White, 1020);
+    draw_text(
+        enabling
+            ? "A paired UIF device can install validated packages"
+            : "Future transfers will stay on the SD card",
+        654,
+        410,
+        29,
+        White,
+        1010);
+    draw_text(
+        enabling
+            ? "only when you choose Copy and install for that transfer."
+            : "until you install them from Packages.",
+        654,
+        462,
+        29,
+        White,
+        1010);
+    draw_text("Copy files only remains UIF's default.", 654, 558, 27, Muted, 990);
+    draw_button("Cancel", 1060, 744, 260, TouchCommand::Back);
+    draw_button(enabling ? "Enable" : "Disable", 1344, 744, 330, TouchCommand::Confirm, 0, true);
+}
+
 void draw_install_progress(const AssistantUiModel *model)
 {
     touchTargets.clear();
@@ -1719,11 +1752,19 @@ void draw_config_page(const AssistantUiModel *model)
     draw_metric("UI", model->simple_ui ? "simple" : "full", 1412, 490, 360);
 
     draw_text(model->manual_install_enabled ? "Manual install: enabled" : "Manual install: disabled", 444, 610, 28, model->manual_install_enabled ? Ready : Muted, 620);
-    draw_text(model->auto_install_enabled ? "Automatic install: enabled" : "Automatic install: disabled", 1040, 610, 28, model->auto_install_enabled ? Ready : Muted, 700);
-    draw_text("Change config.json, then restart.", 444, 658, 26, Muted, 760);
+    draw_button(
+        model->auto_install_enabled ? "Automatic installs: On" : "Automatic installs: Off",
+        1010,
+        590,
+        520,
+        TouchCommand::AutoInstall,
+        0,
+        model->auto_install_enabled,
+        model->install_enabled);
+    draw_text(model->install_enabled ? "A or tap to change this setting." : "Install assistance is disabled by config.json.", 444, 682, 26, model->install_enabled ? Muted : Warn, 1040);
     char component[160];
     std::snprintf(component, sizeof(component), "Version %s | Build %s", safe(model->component_version), safe(model->build_id));
-    draw_text(component, 444, 704, 25, Dim, 1120);
+    draw_text(component, 444, 734, 25, Dim, 1120);
 }
 
 void draw_simple_ui(const AssistantUiModel *model)
@@ -1733,6 +1774,8 @@ void draw_simple_ui(const AssistantUiModel *model)
 
     SDL_Color stateColor = Ready;
     if (model->transfer_active)
+        stateColor = Warn;
+    else if (std::strcmp(model->connection_state, "Starting") == 0)
         stateColor = Warn;
     else if (std::strcmp(model->connection_state, "Ready") != 0 && std::strcmp(model->connection_state, "Paired") != 0)
         stateColor = Danger;
@@ -1752,15 +1795,27 @@ void draw_simple_ui(const AssistantUiModel *model)
     std::snprintf(pair, sizeof(pair), "%06u", model->pairing_code);
 
     draw_panel(54, 142, 860, 354, model->paired ? Ready : AccentDark);
-    draw_text(model->paired ? "Paired" : "Pairing Code", 92, 182, 42, White, 520);
-    draw_text(model->paired ? "Connected to UIF" : pair, 92, 250, model->paired ? 54 : 112, model->paired ? Ready : AccentLight, 720);
-    draw_text(model->paired ? "Ready for transfers from UIF." : "Enter this code in UIF.", 96, 396, 30, Muted, 720);
+    draw_text(model->startup_active ? "Starting Assistant" : model->paired ? "Paired" : "Pairing Code", 92, 182, 42, White, 720);
+    draw_text(model->startup_active ? "Please wait" : model->paired ? "Connected to UIF" : pair, 92, 250, model->startup_active ? 64 : model->paired ? 54 : 112, model->paired ? Ready : AccentLight, 720);
+    draw_text(model->startup_active ? safe(model->status) : model->paired ? "Ready for transfers from UIF." : "Enter this code in UIF.", 96, 396, 30, Muted, 720);
 
     draw_panel(952, 142, 914, 354, Border);
     draw_text("Receiver", 990, 182, 42, White, 520);
     draw_compact_metric("Address", endpoint, 990, 254, 520);
     draw_compact_metric("SD", safe(model->sd_root), 1538, 254, 268);
-    draw_text("Keep this open during transfers.", 990, 396, 30, Muted, 740);
+    draw_text("Keep open during transfers.", 990, 396, 28, Muted, 430);
+    if (model->startup_active)
+        draw_text("Settings available when ready.", 1440, 410, 27, Dim, 366);
+    else
+        draw_button(
+            model->auto_install_enabled ? "Auto install: On" : "Auto install: Off",
+            1440,
+            384,
+            366,
+            TouchCommand::AutoInstall,
+            0,
+            model->auto_install_enabled,
+            model->install_enabled);
 
     draw_panel(54, 530, 1812, 292, model->transfer_active ? Accent : Border);
     draw_text("Transfer", 92, 570, 42, White, 420);
@@ -1784,7 +1839,11 @@ void draw_simple_ui(const AssistantUiModel *model)
     draw_text("HOME", 1660, 890, 30, Muted, 160);
 
     draw_text("A Refresh", 62, 1022, 27, Dim, 260);
-    draw_text("HOME Menu", 330, 1022, 27, Dim, 280);
+    if (!model->startup_active)
+        draw_text("X Auto install", 330, 1022, 27, Dim, 330);
+    draw_text("HOME Menu", model->startup_active ? 330 : 690, 1022, 27, Dim, 280);
+    if (autoInstallConfirmOpen)
+        draw_auto_install_confirmation();
     SDL_RenderPresent(renderer);
     refreshRequested = false;
 }
@@ -1867,6 +1926,8 @@ extern "C" void assistant_ui_render(const AssistantUiModel *model)
         return;
 
     cachedInstallEnabled = model->install_enabled && model->manual_install_enabled;
+    cachedInstallGloballyEnabled = model->install_enabled;
+    cachedAutoInstallEnabled = model->auto_install_enabled;
     installActive = model->install_active;
     simpleUi = model->simple_ui;
     touchTargets.clear();
@@ -1883,6 +1944,8 @@ extern "C" void assistant_ui_render(const AssistantUiModel *model)
     }
     if (!cachedInstallEnabled)
         installConfirmOpen = false;
+    if (!cachedInstallGloballyEnabled)
+        autoInstallConfirmOpen = false;
 
     update_render_metrics(model->ui_scale);
 
@@ -1982,6 +2045,8 @@ extern "C" void assistant_ui_render(const AssistantUiModel *model)
             draw_button("Refresh", 1620, 912, 210, TouchCommand::Refresh);
         if (installConfirmOpen || launchConfirmOpen)
             draw_confirmation();
+        else if (autoInstallConfirmOpen)
+            draw_auto_install_confirmation();
     }
 
     SDL_RenderPresent(renderer);
@@ -1994,6 +2059,7 @@ void select_page(int page)
     contentFocused = false;
     installConfirmOpen = false;
     launchConfirmOpen = false;
+    autoInstallConfirmOpen = false;
     if (selectedPage == PackagesPageIndex)
         packagesLoaded = false;
     if (selectedPage == InstalledTitlesPageIndex)
@@ -2010,10 +2076,11 @@ bool handle_navigation_buttons(uint32_t trigger)
 
     if ((trigger & VPAD_BUTTON_B) != 0)
     {
-        if (installConfirmOpen || launchConfirmOpen)
+        if (installConfirmOpen || launchConfirmOpen || autoInstallConfirmOpen)
         {
             installConfirmOpen = false;
             launchConfirmOpen = false;
+            autoInstallConfirmOpen = false;
         }
         else if (contentFocused)
             contentFocused = false;
@@ -2023,8 +2090,27 @@ bool handle_navigation_buttons(uint32_t trigger)
         return true;
     }
 
+    if (autoInstallConfirmOpen)
+    {
+        if ((trigger & VPAD_BUTTON_A) != 0)
+        {
+            std::memset(&pendingAction, 0, sizeof(pendingAction));
+            pendingAction.type = ASSISTANT_UI_ACTION_SET_AUTO_INSTALL;
+            pendingAction.enabled = !cachedAutoInstallEnabled;
+            autoInstallConfirmOpen = false;
+        }
+        refreshRequested = true;
+        return true;
+    }
+
     if (simpleUi)
     {
+        if ((trigger & VPAD_BUTTON_X) != 0 && cachedInstallGloballyEnabled)
+        {
+            autoInstallConfirmOpen = true;
+            refreshRequested = true;
+            return true;
+        }
         refreshRequested = (trigger & VPAD_BUTTON_A) != 0;
         storageRefreshRequested = storageRefreshRequested || refreshRequested;
         return refreshRequested;
@@ -2073,6 +2159,12 @@ bool handle_navigation_buttons(uint32_t trigger)
             select_page((selectedPage + 1) % PageCount);
         else if ((trigger & VPAD_BUTTON_A) != 0)
         {
+            if (selectedPage == ConfigPageIndex && cachedInstallGloballyEnabled)
+            {
+                autoInstallConfirmOpen = true;
+                refreshRequested = true;
+                return true;
+            }
             contentFocused = (selectedPage == PackagesPageIndex && !cachedInstallPackages.empty())
                 || (selectedPage == InstalledTitlesPageIndex && !cachedInstalledTitles.empty());
             if (!contentFocused)
@@ -2155,6 +2247,10 @@ void handle_touch_command(const TouchTarget &target)
         case TouchCommand::Usb:
             if (!selected_package_requires_nand())
                 selectedInstallTarget = 1;
+            break;
+        case TouchCommand::AutoInstall:
+            if (cachedInstallGloballyEnabled)
+                autoInstallConfirmOpen = true;
             break;
     }
     refreshRequested = true;
@@ -2343,6 +2439,7 @@ extern "C" void assistant_ui_invalidate_storage(void)
     installedTitlesLoaded = false;
     installConfirmOpen = false;
     launchConfirmOpen = false;
+    autoInstallConfirmOpen = false;
     touchArmed = false;
     refreshRequested = true;
 }

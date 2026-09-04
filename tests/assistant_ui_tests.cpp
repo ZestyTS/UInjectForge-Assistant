@@ -81,9 +81,12 @@ void reset_navigation()
     contentFocused = false;
     installConfirmOpen = false;
     launchConfirmOpen = false;
+    autoInstallConfirmOpen = false;
     touchHeld = false;
     touchArmed = false;
     cachedInstallEnabled = true;
+    cachedInstallGloballyEnabled = true;
+    cachedAutoInstallEnabled = false;
     selectedPage = PackagesPageIndex;
     selectedPackageIndex = 0;
     selectedInstalledTitleIndex = 0;
@@ -172,6 +175,29 @@ void navigation_tests()
     handle_navigation_buttons(VPAD_BUTTON_X);
     assert(assistant_ui_take_storage_refresh_request());
     assert(!assistant_ui_take_storage_refresh_request());
+
+    reset_navigation();
+    simpleUi = true;
+    handle_navigation_buttons(VPAD_BUTTON_X);
+    assert(autoInstallConfirmOpen && pendingAction.type == ASSISTANT_UI_ACTION_NONE);
+    handle_navigation_buttons(VPAD_BUTTON_A);
+    assert(assistant_ui_take_action(&action));
+    assert(action.type == ASSISTANT_UI_ACTION_SET_AUTO_INSTALL && action.enabled);
+
+    reset_navigation();
+    cachedAutoInstallEnabled = true;
+    select_page(ConfigPageIndex);
+    handle_navigation_buttons(VPAD_BUTTON_A);
+    assert(autoInstallConfirmOpen);
+    handle_navigation_buttons(VPAD_BUTTON_A);
+    assert(assistant_ui_take_action(&action));
+    assert(action.type == ASSISTANT_UI_ACTION_SET_AUTO_INSTALL && !action.enabled);
+
+    reset_navigation();
+    simpleUi = true;
+    cachedInstallGloballyEnabled = false;
+    handle_navigation_buttons(VPAD_BUTTON_X);
+    assert(!autoInstallConfirmOpen && !assistant_ui_take_action(&action));
 }
 
 void touch_tests()
@@ -379,7 +405,7 @@ void render_tests(const char *output)
                 assert(target.rect.x >= 0 && target.rect.y >= 0
                     && target.rect.x + target.rect.w <= DesignWidth
                     && target.rect.y + target.rect.h <= DesignHeight);
-            if (page == PackagesPageIndex || page == InstalledTitlesPageIndex || page == 0)
+            if (page == PackagesPageIndex || page == InstalledTitlesPageIndex || page == ConfigPageIndex || page == 0)
                 save_frame(std::filesystem::path(output) / (std::to_string(size.first) + "-page-" + std::to_string(page) + ".bmp"));
         }
         select_page(PackagesPageIndex);
@@ -397,6 +423,26 @@ void render_tests(const char *output)
         save_frame(std::filesystem::path(output) / (std::to_string(size.first) + "-install.bmp"));
         model.install_active = false;
         assistant_ui_set_install_active(false);
+
+        model.simple_ui = true;
+        assistant_ui_render(&model);
+        save_frame(std::filesystem::path(output) / (std::to_string(size.first) + "-simple.bmp"));
+        handle_navigation_buttons(VPAD_BUTTON_X);
+        assistant_ui_render(&model);
+        save_frame(std::filesystem::path(output) / (std::to_string(size.first) + "-auto-install-confirm.bmp"));
+        autoInstallConfirmOpen = false;
+
+        model.startup_active = true;
+        model.install_enabled = false;
+        std::snprintf(model.connection_state, sizeof(model.connection_state), "Starting");
+        std::snprintf(model.status, sizeof(model.status), "Connecting network.");
+        assistant_ui_render(&model);
+        save_frame(std::filesystem::path(output) / (std::to_string(size.first) + "-startup.bmp"));
+        model.startup_active = false;
+        model.install_enabled = true;
+        model.simple_ui = false;
+        std::snprintf(model.connection_state, sizeof(model.connection_state), "Ready");
+        std::snprintf(model.status, sizeof(model.status), "Receiver ready.");
     }
     assert(allocations == 0);
     std::filesystem::remove_all(fixtures);

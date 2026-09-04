@@ -41,6 +41,7 @@ typedef struct
     bool passive_broadcast_enabled;
     bool broadcast_socket_ready;
     bool simple_ui;
+    bool startup_active;
     bool install_enabled;
     bool manual_install_enabled;
     bool auto_install_enabled;
@@ -86,6 +87,7 @@ typedef enum
     ASSISTANT_UI_ACTION_INSTALL_TO_NAND,
     ASSISTANT_UI_ACTION_INSTALL_TO_USB,
     ASSISTANT_UI_ACTION_LAUNCH_TITLE,
+    ASSISTANT_UI_ACTION_SET_AUTO_INSTALL,
 } AssistantUiActionType;
 
 typedef struct
@@ -94,6 +96,7 @@ typedef struct
     char package_name[256];
     char title_id[17];
     char title_name[256];
+    bool enabled;
 } AssistantUiAction;
 
 #ifdef __cplusplus

@@ -69,6 +69,7 @@
 #define UIF_UPLOAD_IDLE_TIMEOUT_MS (30U * 1000U)
 #define UIF_UPLOAD_RENDER_INTERVAL_MS 500U
 #define UIF_STATUS_JSON_BUFFER 32768U
+#define UIF_STARTUP_THREAD_STACK_SIZE 0x20000U
 #define UIF_COLOR_BACKGROUND 0x090A0F00
 #define UIF_COLOR_PANEL 0x16162200
 #define UIF_COLOR_PANEL_ALT 0x20202900
@@ -85,6 +86,11 @@ static volatile bool g_install_completed = false;
 static volatile IOSError g_install_error = 0;
 static unsigned int g_log_revision = 0;
 static unsigned int g_storage_revision = 0;
+static volatile bool g_startup_worker_active = false;
+static volatile unsigned int g_startup_status_sequence = 0;
+static char g_startup_status[UIF_MAX_TEXT];
+static OSThread g_startup_thread __attribute__((aligned(8)));
+static uint8_t g_startup_thread_stack[UIF_STARTUP_THREAD_STACK_SIZE] __attribute__((aligned(0x20)));
 
 static void install_callback(IOSError error_code, void *context)
 {
@@ -213,6 +219,15 @@ typedef struct
 
 typedef struct
 {
+    AssistantState *state;
+    volatile bool finished;
+    bool success;
+} AssistantStartupContext;
+
+static AssistantStartupContext g_startup_context;
+
+typedef struct
+{
     bool sd_accessible;
     bool sd_space_known;
     long long sd_free_bytes;
@@ -261,6 +276,30 @@ static void copy_text(char *destination, size_t destination_size, const char *so
     destination[i] = '\0';
 }
 
+static void publish_startup_status(const char *message)
+{
+    __sync_add_and_fetch(&g_startup_status_sequence, 1);
+    copy_text(g_startup_status, sizeof(g_startup_status), message);
+    __sync_synchronize();
+    __sync_add_and_fetch(&g_startup_status_sequence, 1);
+}
+
+static unsigned int read_startup_status(char *destination, size_t destination_size)
+{
+    for (;;)
+    {
+        unsigned int before = g_startup_status_sequence;
+        if ((before & 1U) != 0)
+            continue;
+        __sync_synchronize();
+        copy_text(destination, destination_size, g_startup_status);
+        __sync_synchronize();
+        unsigned int after = g_startup_status_sequence;
+        if (before == after && (after & 1U) == 0)
+            return after;
+    }
+}
+
 static void copy_display_name(char *destination, size_t destination_size, const char *source)
 {
     if (!destination || destination_size == 0)
@@ -300,6 +339,11 @@ static void set_status(AssistantState *state, const char *message)
 {
     copy_text(state->status, sizeof(state->status), message);
     append_activity(state, state->status);
+    if (g_startup_worker_active)
+    {
+        publish_startup_status(state->status);
+        return;
+    }
     WHBLogPrintf("%s", state->status);
     render_assistant_screen(state);
 }
@@ -672,6 +716,24 @@ static void render_assistant_screen(const AssistantState *state)
     model.last_transfer_total_bytes = state->last_transfer_result.total_bytes;
     model.last_transfer_uploaded_bytes = state->last_transfer_result.uploaded_bytes;
 
+    assistant_ui_render(&model);
+}
+
+static void render_startup_screen(const char *status)
+{
+    AssistantUiModel model;
+    memset(&model, 0, sizeof(model));
+    copy_text(model.connection_state, sizeof(model.connection_state), "Starting");
+    copy_text(model.ip_address, sizeof(model.ip_address), "waiting");
+    copy_text(model.component_version, sizeof(model.component_version), UIF_COMPONENT_VERSION);
+    copy_text(model.build_id, sizeof(model.build_id), UIF_COMPONENT_BUILD_ID);
+    copy_text(model.status, sizeof(model.status), status);
+    copy_text(model.activity_log[0], sizeof(model.activity_log[0]), status);
+    model.activity_count = status && status[0] ? 1 : 0;
+    model.http_port = UIF_ASSISTANT_PORT;
+    model.simple_ui = true;
+    model.startup_active = true;
+    model.ui_scale = UIF_ASSISTANT_DEFAULT_UI_SCALE;
     assistant_ui_render(&model);
 }
 
@@ -1919,6 +1981,98 @@ static void load_assistant_config(AssistantState *state)
         }
     }
 
+}
+
+static void load_assistant_preferences(AssistantState *state)
+{
+    char preferences_path[UIF_MAX_PATH];
+    if (!join_path_checked(
+            preferences_path,
+            sizeof(preferences_path),
+            state->sd_root,
+            "uinjectforge/assistant/preferences.json"))
+        return;
+
+    FILE *file = fopen(preferences_path, "rb");
+    if (!file)
+        return;
+
+    char json[1024];
+    size_t read = fread(json, 1, sizeof(json) - 1, file);
+    fclose(file);
+    json[read] = '\0';
+
+    bool auto_install_enabled = state->auto_install_enabled;
+    if (json_get_bool(json, "autoInstallEnabled", &auto_install_enabled))
+        state->auto_install_enabled = state->install_enabled && auto_install_enabled;
+}
+
+static bool save_assistant_preferences(const AssistantState *state, char *error, size_t error_size)
+{
+    char preferences_root[UIF_MAX_PATH];
+    char preferences_path[UIF_MAX_PATH];
+    char temporary_path[UIF_MAX_PATH];
+    char backup_path[UIF_MAX_PATH];
+    if (!join_path_checked(preferences_root, sizeof(preferences_root), state->sd_root, "uinjectforge/assistant")
+        || !join_path_checked(preferences_path, sizeof(preferences_path), preferences_root, "preferences.json")
+        || !join_path_checked(temporary_path, sizeof(temporary_path), preferences_root, "preferences.json.tmp")
+        || !join_path_checked(backup_path, sizeof(backup_path), preferences_root, "preferences.json.bak"))
+    {
+        snprintf(error, error_size, "Assistant preferences path is too long.");
+        return false;
+    }
+
+    if (!mkdir_recursive(preferences_root))
+    {
+        snprintf(error, error_size, "Assistant could not create its preferences folder on SD.");
+        return false;
+    }
+
+    unlink(temporary_path);
+    unlink(backup_path);
+    FILE *file = fopen(temporary_path, "wb");
+    if (!file)
+    {
+        snprintf(error, error_size, "Assistant could not open its temporary preferences file.");
+        return false;
+    }
+
+    int written = fprintf(
+        file,
+        "{\n"
+        "  \"schemaVersion\": 1,\n"
+        "  \"autoInstallEnabled\": %s\n"
+        "}\n",
+        state->auto_install_enabled ? "true" : "false");
+    bool write_succeeded = written > 0 && fflush(file) == 0;
+    if (fclose(file) != 0)
+        write_succeeded = false;
+    if (!write_succeeded)
+    {
+        unlink(temporary_path);
+        snprintf(error, error_size, "Assistant could not finish writing its preferences file.");
+        return false;
+    }
+
+    bool had_existing_preferences = path_exists(preferences_path);
+    if (had_existing_preferences && rename(preferences_path, backup_path) != 0)
+    {
+        unlink(temporary_path);
+        snprintf(error, error_size, "Assistant could not preserve its existing preferences.");
+        return false;
+    }
+
+    if (rename(temporary_path, preferences_path) != 0)
+    {
+        if (had_existing_preferences)
+            rename(backup_path, preferences_path);
+        unlink(temporary_path);
+        snprintf(error, error_size, "Assistant could not publish its updated preferences.");
+        return false;
+    }
+
+    unlink(backup_path);
+    return true;
 }
 
 static const char *find_matching_brace(const char *start)
@@ -5114,6 +5268,7 @@ static bool initialize_services(AssistantState *state)
     copy_text(state->sd_root, sizeof(state->sd_root), WHBGetSdCardMountPath());
     set_status(state, "Loading assistant config.");
     load_assistant_config(state);
+    load_assistant_preferences(state);
     set_status(state, "Checking interrupted transfers.");
     recover_assistant_storage(state);
 
@@ -5125,14 +5280,10 @@ static bool initialize_services(AssistantState *state)
         return false;
     }
 
-    set_status(state, "Initializing network.");
-    ACInitialize();
-    set_status(state, "Connecting network.");
+    set_status(state, "Waiting for network.");
     ACConnect();
     set_status(state, "Resolving IP address.");
     resolve_ip_address(state);
-    set_status(state, "Initializing sockets.");
-    socket_lib_init();
 
     set_status(state, "Opening HTTP listener.");
     state->server_fd = start_server_socket(state->http_port);
@@ -5147,6 +5298,16 @@ static bool initialize_services(AssistantState *state)
 
     set_status(state, "Receiver ready.");
     return true;
+}
+
+static int initialize_services_thread(int argc, const char **argv)
+{
+    (void)argc;
+    AssistantStartupContext *context = (AssistantStartupContext *)argv;
+    context->success = initialize_services(context->state);
+    __sync_synchronize();
+    context->finished = true;
+    return context->success ? 0 : 1;
 }
 
 static void shutdown_services(AssistantState *state)
@@ -5212,18 +5373,43 @@ int main(int argc, char **argv)
     WPADEnableURCC(1);
 
     static AssistantState state;
-    bool initialized = initialize_services(&state);
-    if (initialized)
+    memset(&g_startup_context, 0, sizeof(g_startup_context));
+    g_startup_context.state = &state;
+    g_startup_worker_active = true;
+    publish_startup_status("Preparing background services.");
+    render_startup_screen("Preparing background services.");
+
+    bool startup_thread_running = OSCreateThread(
+        &g_startup_thread,
+        initialize_services_thread,
+        1,
+        (char *)&g_startup_context,
+        g_startup_thread_stack + sizeof(g_startup_thread_stack),
+        sizeof(g_startup_thread_stack),
+        16,
+        OS_THREAD_ATTRIB_AFFINITY_ANY);
+    bool initialized = false;
+    if (startup_thread_running)
     {
-        AssistantTelemetryEvent startup_event = {
-            .event_type = "assistant-start",
-            .source = "assistant",
-            .result = "ready",
-            .message = "UInjectForge Assistant started and mounted the SD telemetry folder.",
-        };
-        assistant_telemetry_write_event(state.sd_root, &startup_event, NULL);
+        OSResumeThread(&g_startup_thread);
     }
-    print_startup_screen(&state);
+    else
+    {
+        g_startup_worker_active = false;
+        memset(&state, 0, sizeof(state));
+        state.server_fd = -1;
+        state.broadcast_fd = -1;
+        state.http_port = UIF_ASSISTANT_PORT;
+        state.broadcast_port = UIF_ASSISTANT_PORT;
+        state.simple_ui = true;
+        state.install_enabled = true;
+        state.manual_install_enabled = true;
+        state.ui_scale = UIF_ASSISTANT_DEFAULT_UI_SCALE;
+        copy_text(state.ip_address, sizeof(state.ip_address), "unknown");
+        copy_text(state.status, sizeof(state.status), "Assistant could not start its background service thread. Restart the app.");
+        print_startup_screen(&state);
+    }
+    unsigned int last_startup_status_sequence = 0;
     uint64_t last_heartbeat_ticks = OSGetTime();
 
     while (!g_procui_exit_requested)
@@ -5236,6 +5422,44 @@ int main(int argc, char **argv)
 
         assistant_ui_poll_input();
 
+        if (startup_thread_running)
+        {
+            if (g_startup_context.finished)
+            {
+                __sync_synchronize();
+                initialized = g_startup_context.success;
+                OSJoinThread(&g_startup_thread, NULL);
+                startup_thread_running = false;
+                g_startup_worker_active = false;
+                if (initialized)
+                {
+                    AssistantTelemetryEvent startup_event = {
+                        .event_type = "assistant-start",
+                        .source = "assistant",
+                        .result = "ready",
+                        .message = "UInjectForge Assistant started and mounted the SD telemetry folder.",
+                    };
+                    assistant_telemetry_write_event(state.sd_root, &startup_event, NULL);
+                }
+                print_startup_screen(&state);
+                last_heartbeat_ticks = OSGetTime();
+            }
+            else
+            {
+                char startup_status[UIF_MAX_TEXT];
+                unsigned int sequence = read_startup_status(startup_status, sizeof(startup_status));
+                bool refresh_requested = assistant_ui_take_refresh_request();
+                if (sequence != last_startup_status_sequence || refresh_requested)
+                {
+                    WHBLogPrintf("%s", startup_status);
+                    render_startup_screen(startup_status);
+                    last_startup_status_sequence = sequence;
+                }
+                OSSleepTicks(OSMillisecondsToTicks(25));
+                continue;
+            }
+        }
+
         if (initialized)
         {
             AssistantUiAction action;
@@ -5246,6 +5470,32 @@ int main(int argc, char **argv)
                     char error[UIF_MAX_TEXT];
                     if (!queue_title_launch(&state, action.title_id, error, sizeof(error)))
                         set_status(&state, error);
+                }
+                else if (action.type == ASSISTANT_UI_ACTION_SET_AUTO_INSTALL)
+                {
+                    if (action.enabled && !state.install_enabled)
+                    {
+                        set_status(&state, "Automatic install cannot be enabled while install assistance is disabled in config.json.");
+                    }
+                    else
+                    {
+                        bool previous = state.auto_install_enabled;
+                        state.auto_install_enabled = action.enabled;
+                        char error[UIF_MAX_TEXT];
+                        if (!save_assistant_preferences(&state, error, sizeof(error)))
+                        {
+                            state.auto_install_enabled = previous;
+                            set_status(&state, error);
+                        }
+                        else
+                        {
+                            set_status(
+                                &state,
+                                state.auto_install_enabled
+                                    ? "Automatic installs enabled. UIF still requires Copy and install for each transfer."
+                                    : "Automatic installs disabled. New packages will remain on SD for manual installation.");
+                        }
+                    }
                 }
                 else
                 {
