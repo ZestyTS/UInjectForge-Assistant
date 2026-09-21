@@ -40,7 +40,10 @@
 
 #include "assistant_ui.h"
 #include "assistant_paths.h"
+#include "assistant_json.h"
+#include "assistant_policy.h"
 #include "assistant_security.h"
+#include "assistant_install.h"
 #include "assistant_telemetry.h"
 #include "assistant_storage.h"
 
@@ -51,7 +54,7 @@
 #ifndef UIF_COMPONENT_BUILD_ID
 #define UIF_COMPONENT_BUILD_ID "dev"
 #endif
-#define UIF_ASSISTANT_CAPABILITIES_JSON "[\"pairing\",\"transfer-v1\",\"manual-install\",\"auto-install\",\"installed-titles\",\"console-events\",\"title-launch\",\"setup-check\"]"
+#define UIF_ASSISTANT_CAPABILITIES_JSON "[\"pairing\",\"transfer-v1\",\"manual-install\",\"auto-install\",\"installed-titles\",\"console-events\",\"title-launch\",\"setup-check\",\"overlapped-upload-install\",\"transfer-results-by-id\"]"
 #define UIF_ASSISTANT_PORT 8573
 #define UIF_MAX_FILES 768
 #define UIF_MAX_PATH 768
@@ -64,8 +67,6 @@
 #define UIF_MAX_SETUP_PACKAGES 512
 #define UIF_MCP_COMMAND_INSTALL_ASYNC 0x81
 #define UIF_MCP_INSTALL_PATH_LENGTH 0x27F
-#define UIF_INSTALL_STALL_TIMEOUT_MS (15U * 60U * 1000U)
-#define UIF_INSTALL_MAX_RUNTIME_MS (90U * 60U * 1000U)
 #define UIF_UPLOAD_IDLE_TIMEOUT_MS (30U * 1000U)
 #define UIF_UPLOAD_RENDER_INTERVAL_MS 500U
 #define UIF_STATUS_JSON_BUFFER 32768U
@@ -202,6 +203,9 @@ typedef struct
     unsigned int activity_count;
     AssistantTransfer transfer;
     AssistantTransferResult last_transfer_result;
+    AssistantTransferResult pending_install_result;
+    AssistantTransferResult recent_results[8];
+    unsigned int next_result;
     bool receiving_file;
     char receiving_file_path[UIF_MAX_PATH];
     long long receiving_file_bytes;
@@ -216,6 +220,57 @@ typedef struct
     char pending_title_name[UIF_MAX_TEXT];
     char pending_launch_event_id[64];
 } AssistantState;
+
+typedef struct {
+    AssistantInstallLifecycle lifecycle;
+    AssistantUiAction action;
+    AssistantTransferResult transfer_result;
+    bool automatic, submitted, home_was_enabled;
+    MCPError handle;
+    MCPInstallInfo *install_info;
+    MCPInstallProgress *progress;
+    IOSVec *path_vector;
+    char *install_path;
+    uint32_t *callback_context;
+    uint64_t observed_title_id, last_render_ms;
+    char event_id[64], failure[UIF_MAX_TEXT];
+} AssistantInstallContext;
+static AssistantInstallContext g_install;
+static void tick_install(AssistantState *state);
+static void service_install_status_request(AssistantState *state);
+
+static void store_transfer_result(AssistantState *state, const AssistantTransferResult *result)
+{
+    // A completed install must not overwrite the identity of a later upload.
+    for (unsigned int i = 0; i < 8; i++) {
+        if (state->recent_results[i].has_result
+            && strcmp(state->recent_results[i].transfer_id, result->transfer_id) == 0) {
+            state->recent_results[i] = *result;
+            state->last_transfer_result = *result;
+            return;
+        }
+    }
+    state->recent_results[state->next_result++ % 8] = *result;
+    state->last_transfer_result = *result;
+}
+static const AssistantTransferResult *find_transfer_result(const AssistantState *state, const char *id)
+{
+    if (state->auto_install_pending && strcmp(state->pending_install_result.transfer_id, id) == 0)
+        return &state->pending_install_result;
+    if (state->install_active && g_install.automatic && strcmp(g_install.transfer_result.transfer_id, id) == 0)
+        return &g_install.transfer_result;
+    for (unsigned int i = 0; i < 8; i++)
+        if (state->recent_results[i].has_result && strcmp(state->recent_results[i].transfer_id, id) == 0)
+            return &state->recent_results[i];
+    return NULL;
+}
+static bool transfer_destination_available(const AssistantState *state, const AssistantTransfer *transfer)
+{
+    return assistant_install_destination_allowed(
+        state->install_active ? g_install.action.package_name : NULL,
+        state->auto_install_pending ? state->auto_install_action.package_name : NULL,
+        transfer->target_root_kind, transfer->target_root);
+}
 
 typedef struct
 {
@@ -601,7 +656,7 @@ static void record_transfer_result(
     result.uploaded_files = transfer->uploaded_files;
     result.total_bytes = transfer->total_bytes;
     result.uploaded_bytes = transfer->uploaded_bytes;
-    state->last_transfer_result = result;
+    store_transfer_result(state, &result);
 
     AssistantTelemetryEvent event = {
         .event_type = "transfer-result",
@@ -819,7 +874,7 @@ static bool path_has_allowed_sd_prefix(const char *path)
         "wiiu"
     };
 
-    if (equals_ignore_case(path, "controller.ini"))
+    if (equals_ignore_case(path, "controller.ini") || assistant_sd_config_path_allowed(path))
         return true;
 
     size_t path_length = strlen(path);
@@ -1623,7 +1678,7 @@ static int find_header_end(const char *buffer, int used)
     return -1;
 }
 
-static bool parse_http_request(int fd, HttpRequest *request)
+static bool parse_http_request(int fd, HttpRequest *request, unsigned int header_budget_ms)
 {
     memset(request, 0, sizeof(*request));
     request->content_length = 0;
@@ -1632,9 +1687,12 @@ static bool parse_http_request(int fd, HttpRequest *request)
     char header[UIF_MAX_HEADER + 1];
     int used = 0;
     int header_end = -1;
+    uint64_t started = OSGetTime();
 
     while (used < UIF_MAX_HEADER)
     {
+        if (OSGetTime() - started >= OSMillisecondsToTicks(header_budget_ms))
+            return false;
         ssize_t read_bytes = recv(fd, header + used, UIF_MAX_HEADER - used, 0);
         if (read_bytes < 0 && errno == EINTR)
             continue;
@@ -1756,42 +1814,7 @@ static const char *find_json_key(const char *json, const char *key)
 
 static bool json_get_string(const char *json, const char *key, char *output, size_t output_size)
 {
-    const char *position = find_json_key(json, key);
-    if (!position || *position != '"')
-        return false;
-
-    position++;
-    size_t out = 0;
-    while (*position && *position != '"')
-    {
-        char c = *position++;
-        if (c == '\\')
-        {
-            c = *position++;
-            if (c == 'n')
-                c = '\n';
-            else if (c == 'r')
-                c = '\r';
-            else if (c == 't')
-                c = '\t';
-            else if (c == 'u')
-            {
-                for (int i = 0; i < 4 && isxdigit((unsigned char)*position); i++)
-                    position++;
-                c = '?';
-            }
-        }
-
-        if (out + 1 >= output_size)
-            return false;
-        output[out++] = c;
-    }
-
-    if (*position != '"')
-        return false;
-
-    output[out] = '\0';
-    return true;
+    return assistant_json_decode_string(find_json_key(json, key), output, output_size);
 }
 
 static bool json_get_long(const char *json, const char *key, long long *output)
@@ -2292,9 +2315,15 @@ static bool parse_manifest(AssistantState *state, const char *json, char *error,
         return false;
     }
 
-    if (state->transfer.active)
+    if (state->transfer.active || state->auto_install_pending)
     {
-        snprintf(error, error_size, "Another Assistant transfer is already active. Finish or cancel it before starting a new transfer.");
+        snprintf(error, error_size, "Another transfer or queued install owns the next package slot. Wait for it to start installing.");
+        return false;
+    }
+
+    if (!transfer_destination_available(state, &transfer))
+    {
+        snprintf(error, error_size, "This destination is in use by installation. Send a different install package or wait for installation to finish.");
         return false;
     }
 
@@ -2453,6 +2482,8 @@ static bool receive_file_body(
         }
 
         assistant_ui_poll_input();
+        tick_install(state);
+        service_install_status_request(state);
         handle_discovery_probe(state);
         send_discovery_broadcast(state);
 
@@ -2658,6 +2689,19 @@ static bool commit_transfer(AssistantState *state, char *error, size_t error_siz
         join_path(final_root, sizeof(final_root), state->sd_root, transfer->target_root);
         join_path(backup_parent, sizeof(backup_parent), state->sd_root, "uinjectforge/assistant/backups");
         join_path(backup_root, sizeof(backup_root), backup_parent, transfer->transfer_id);
+
+        if (equals_ignore_case(transfer->package_kind, "installable-wup"))
+        {
+            AssistantPackagePolicy policy = assistant_policy_read(staged_root);
+            if (policy == ASSISTANT_POLICY_INVALID
+                || (transfer->system_memory_install_required
+                    && policy != ASSISTANT_POLICY_NAND && !assistant_policy_write(staged_root, true)))
+            {
+                snprintf(error, error_size, "Install requirements are invalid or could not be saved. Resend the package.");
+                return false;
+            }
+            if (policy == ASSISTANT_POLICY_NAND) transfer->system_memory_install_required = true;
+        }
 
         if (!path_exists(staged_root) || !ensure_parent_directory(final_root) || !mkdir_recursive(backup_parent))
         {
@@ -2871,6 +2915,52 @@ static void build_controller_summary(char *summary, size_t summary_size)
     checked_at = now;
 }
 
+static void build_transfer_result_json(const AssistantTransferResult *result, char *output, size_t capacity)
+{
+    if (result->has_result)
+    {
+        char result_status[96];
+        char result_transfer_id[128];
+        char result_package_name[UIF_MAX_TEXT * 2];
+        char result_package_kind[128];
+        char result_target_root[UIF_MAX_PATH * 2];
+        char result_action[128];
+        char result_message[UIF_MAX_TEXT * 2];
+        char result_failed_file[UIF_MAX_PATH * 2];
+        json_escape(result->status, result_status, sizeof(result_status));
+        json_escape(result->transfer_id, result_transfer_id, sizeof(result_transfer_id));
+        json_escape(result->package_display_name, result_package_name, sizeof(result_package_name));
+        json_escape(result->package_kind, result_package_kind, sizeof(result_package_kind));
+        json_escape(result->target_root, result_target_root, sizeof(result_target_root));
+        json_escape(result->post_transfer_action, result_action, sizeof(result_action));
+        json_escape(result->message, result_message, sizeof(result_message));
+        json_escape(result->failed_file, result_failed_file, sizeof(result_failed_file));
+        snprintf(
+            output,
+            capacity,
+            "{\"hasResult\":true,\"success\":%s,\"canceled\":%s,\"status\":\"%s\",\"transferId\":\"%s\",\"packageDisplayName\":\"%s\",\"packageKind\":\"%s\",\"targetRoot\":\"%s\",\"postTransferAction\":\"%s\",\"message\":\"%s\",\"failedFile\":\"%s\",\"fileCount\":%d,\"uploadedFiles\":%d,\"totalBytes\":%lld,\"uploadedBytes\":%lld}",
+            result->success ? "true" : "false",
+            result->canceled ? "true" : "false",
+            result_status,
+            result_transfer_id,
+            result_package_name,
+            result_package_kind,
+            result_target_root,
+            result_action,
+            result_message,
+            result_failed_file,
+            result->file_count,
+            result->uploaded_files,
+            result->total_bytes,
+            result->uploaded_bytes);
+    }
+    else
+    {
+        copy_text(output, capacity, "{\"hasResult\":false}");
+    }
+
+}
+
 static void handle_status(int fd, AssistantState *state)
 {
     char controller_summary[512];
@@ -2913,55 +3003,14 @@ static void handle_status(int fd, AssistantState *state)
         || sd_free_bytes >= transfer_required_bytes;
 
     char last_transfer_json[8192];
-    if (state->last_transfer_result.has_result)
-    {
-        char result_status[96];
-        char result_transfer_id[128];
-        char result_package_name[UIF_MAX_TEXT * 2];
-        char result_package_kind[128];
-        char result_target_root[UIF_MAX_PATH * 2];
-        char result_action[128];
-        char result_message[UIF_MAX_TEXT * 2];
-        char result_failed_file[UIF_MAX_PATH * 2];
-        json_escape(state->last_transfer_result.status, result_status, sizeof(result_status));
-        json_escape(state->last_transfer_result.transfer_id, result_transfer_id, sizeof(result_transfer_id));
-        json_escape(state->last_transfer_result.package_display_name, result_package_name, sizeof(result_package_name));
-        json_escape(state->last_transfer_result.package_kind, result_package_kind, sizeof(result_package_kind));
-        json_escape(state->last_transfer_result.target_root, result_target_root, sizeof(result_target_root));
-        json_escape(state->last_transfer_result.post_transfer_action, result_action, sizeof(result_action));
-        json_escape(state->last_transfer_result.message, result_message, sizeof(result_message));
-        json_escape(state->last_transfer_result.failed_file, result_failed_file, sizeof(result_failed_file));
-        snprintf(
-            last_transfer_json,
-            sizeof(last_transfer_json),
-            "{\"hasResult\":true,\"success\":%s,\"canceled\":%s,\"status\":\"%s\",\"transferId\":\"%s\",\"packageDisplayName\":\"%s\",\"packageKind\":\"%s\",\"targetRoot\":\"%s\",\"postTransferAction\":\"%s\",\"message\":\"%s\",\"failedFile\":\"%s\",\"fileCount\":%d,\"uploadedFiles\":%d,\"totalBytes\":%lld,\"uploadedBytes\":%lld}",
-            state->last_transfer_result.success ? "true" : "false",
-            state->last_transfer_result.canceled ? "true" : "false",
-            result_status,
-            result_transfer_id,
-            result_package_name,
-            result_package_kind,
-            result_target_root,
-            result_action,
-            result_message,
-            result_failed_file,
-            state->last_transfer_result.file_count,
-            state->last_transfer_result.uploaded_files,
-            state->last_transfer_result.total_bytes,
-            state->last_transfer_result.uploaded_bytes);
-    }
-    else
-    {
-        copy_text(last_transfer_json, sizeof(last_transfer_json), "{\"hasResult\":false}");
-    }
-
+    build_transfer_result_json(&state->last_transfer_result, last_transfer_json, sizeof(last_transfer_json));
     char setup_json[2048];
     build_setup_json(state, setup_json, sizeof(setup_json));
 
     int json_length = snprintf(
         json,
         UIF_STATUS_JSON_BUFFER,
-        "{\"message\":\"%s\",\"deviceName\":\"UInjectForge Assistant\",\"protocolVersion\":\"%s\",\"componentVersion\":\"" UIF_COMPONENT_VERSION "\",\"buildId\":\"" UIF_COMPONENT_BUILD_ID "\",\"capabilities\":" UIF_ASSISTANT_CAPABILITIES_JSON ",\"ipAddress\":\"%s\",\"port\":%d,\"broadcastEnabled\":%s,\"passiveBroadcastEnabled\":%s,\"broadcastPort\":%d,\"broadcastSocketReady\":%s,\"paired\":%s,\"activeTransfer\":%s,\"receivingFile\":%s,\"receivingFilePath\":\"%s\",\"receivingFileBytes\":%lld,\"receivingFileTotalBytes\":%lld,\"simpleUi\":%s,\"installEnabled\":%s,\"manualInstallEnabled\":%s,\"autoInstallEnabled\":%s,\"autoInstallSupported\":true,\"sdRoot\":\"%s\",\"sdSpaceKnown\":%s,\"sdFreeBytes\":%lld,\"sdTotalBytes\":%lld,\"transferRequiredBytes\":%lld,\"transferFitsSd\":%s,\"logPath\":\"%s\",\"controllerSummary\":\"%s\",\"discoveryProbeCount\":%u,\"discoveryReplyCount\":%u,\"discoveryBroadcastCount\":%u,\"loopHeartbeatCount\":%u,\"lastDiscoveryPeer\":\"%s\",\"httpRequestCount\":%u,\"httpErrorCount\":%u,\"pairingAttemptCount\":%u,\"pairingFailureCount\":%u,\"lastHttpRequest\":\"%s\",\"lastHttpError\":\"%s\",\"lastTransfer\":%s,\"setup\":%s}",
+        "{\"message\":\"%s\",\"deviceName\":\"UInjectForge Assistant\",\"protocolVersion\":\"%s\",\"componentVersion\":\"" UIF_COMPONENT_VERSION "\",\"buildId\":\"" UIF_COMPONENT_BUILD_ID "\",\"capabilities\":" UIF_ASSISTANT_CAPABILITIES_JSON ",\"ipAddress\":\"%s\",\"port\":%d,\"broadcastEnabled\":%s,\"passiveBroadcastEnabled\":%s,\"broadcastPort\":%d,\"broadcastSocketReady\":%s,\"paired\":%s,\"activeTransfer\":%s,\"installActive\":%s,\"installQueueFull\":%s,\"receivingFile\":%s,\"receivingFilePath\":\"%s\",\"receivingFileBytes\":%lld,\"receivingFileTotalBytes\":%lld,\"simpleUi\":%s,\"installEnabled\":%s,\"manualInstallEnabled\":%s,\"autoInstallEnabled\":%s,\"autoInstallSupported\":true,\"sdRoot\":\"%s\",\"sdSpaceKnown\":%s,\"sdFreeBytes\":%lld,\"sdTotalBytes\":%lld,\"transferRequiredBytes\":%lld,\"transferFitsSd\":%s,\"logPath\":\"%s\",\"controllerSummary\":\"%s\",\"discoveryProbeCount\":%u,\"discoveryReplyCount\":%u,\"discoveryBroadcastCount\":%u,\"loopHeartbeatCount\":%u,\"lastDiscoveryPeer\":\"%s\",\"httpRequestCount\":%u,\"httpErrorCount\":%u,\"pairingAttemptCount\":%u,\"pairingFailureCount\":%u,\"lastHttpRequest\":\"%s\",\"lastHttpError\":\"%s\",\"lastTransfer\":%s,\"setup\":%s}",
         status,
         UIF_ASSISTANT_PROTOCOL,
         ip_address,
@@ -2971,7 +3020,9 @@ static void handle_status(int fd, AssistantState *state)
         state->broadcast_port,
         state->broadcast_fd >= 0 ? "true" : "false",
         state->paired ? "true" : "false",
-        state->transfer.active ? "true" : "false",
+        (state->transfer.active || state->auto_install_pending) ? "true" : "false",
+        state->install_active ? "true" : "false",
+        state->auto_install_pending ? "true" : "false",
         state->receiving_file ? "true" : "false",
         receiving_file_path,
         state->receiving_file_bytes,
@@ -3228,8 +3279,8 @@ static bool send_finalized_commit_response(int fd, const AssistantState *state, 
     if (!state || !transfer_id || !transfer_id[0])
         return false;
 
-    const AssistantTransferResult *result = &state->last_transfer_result;
-    if (!result->has_result
+    const AssistantTransferResult *result = find_transfer_result(state, transfer_id);
+    if (!result || !result->has_result
         || strcmp(result->transfer_id, transfer_id) != 0
         || !(equals_ignore_case(result->status, "complete")
             || equals_ignore_case(result->status, "ready-to-install")
@@ -3283,6 +3334,12 @@ static void handle_commit(int fd, AssistantState *state, const HttpRequest *requ
             return;
 
         send_message(fd, 404, "Not Found", "Transfer ID is not active.");
+        return;
+    }
+
+    if (!transfer_destination_available(state, &state->transfer) || state->auto_install_pending)
+    {
+        send_message(fd, 409, "Conflict", "Installation owns this destination or the pending slot. The upload is preserved; retry commit after installation advances.");
         return;
     }
 
@@ -3360,6 +3417,7 @@ static void handle_commit(int fd, AssistantState *state, const HttpRequest *requ
         package_name);
     state->auto_install_pending = true;
     record_transfer_result(state, "install-queued", true, false, "Transfer committed. Automatic installation is queued.", "");
+    state->pending_install_result = state->last_transfer_result;
     set_status(state, "Transfer committed. Automatic installation queued.");
     send_json(fd, 200, "OK", "{\"success\":true,\"message\":\"Transfer committed; automatic installation queued.\",\"installSupported\":true,\"performedAction\":\"auto-install-queued\"}");
 }
@@ -3375,7 +3433,16 @@ static void handle_transfer_status(int fd, AssistantState *state, const HttpRequ
     AssistantTransfer *transfer = &state->transfer;
     if (!transfer->active || strcmp(transfer->transfer_id, transfer_id) != 0)
     {
-        send_message(fd, 404, "Not Found", "Transfer ID is not active.");
+        const AssistantTransferResult *result = find_transfer_result(state, transfer_id);
+        if (result)
+        {
+            char result_json[8192], json[8448];
+            build_transfer_result_json(result, result_json, sizeof(result_json));
+            snprintf(json, sizeof(json), "{\"success\":true,\"transferId\":\"%s\",\"result\":%s}", result->transfer_id, result_json);
+            send_json(fd, 200, "OK", json);
+            return;
+        }
+        send_message(fd, 404, "Not Found", "Transfer result is unknown or has expired.");
         return;
     }
 
@@ -3723,6 +3790,12 @@ static bool queue_title_launch(
         return false;
     }
 
+    if (!assistant_title_launch_allowed(state->transfer.active, state->install_active, state->auto_install_pending))
+    {
+        snprintf(error, error_size, "Wait for the transfer and queued installations to finish before launching a title.");
+        return false;
+    }
+
     AssistantTelemetryTitle title;
     if (!assistant_telemetry_find_title(title_id, &title))
     {
@@ -3777,7 +3850,8 @@ static bool queue_title_launch(
 
 static void dispatch_pending_title_launch(AssistantState *state)
 {
-    if (!state || !state->title_launch_pending)
+    if (!state || !state->title_launch_pending
+        || !assistant_title_launch_allowed(state->transfer.active, state->install_active, state->auto_install_pending))
         return;
 
     uint64_t title_id = state->pending_title_id;
@@ -3863,7 +3937,7 @@ static void handle_title_launch(
         return;
     }
 
-    if (state->transfer.active || state->auto_install_pending)
+    if (state->transfer.active || state->auto_install_pending || state->install_active)
     {
         send_message(fd, 409, "Conflict", "Finish the active transfer or install before launching a title.");
         return;
@@ -4333,9 +4407,91 @@ static void record_install_telemetry(
     };
     assistant_telemetry_write_event(state->sd_root, &event, event_id);
 }
+static void complete_install_result(AssistantState *state, AssistantInstallContext *job, bool success)
+{
+    if (!job->automatic || !job->transfer_result.has_result) return;
+    job->transfer_result.success = success;
+    copy_text(job->transfer_result.status, sizeof(job->transfer_result.status), success ? "installed" : "install-failed");
+    copy_text(job->transfer_result.message, sizeof(job->transfer_result.message), state->status);
+    job->transfer_result.completed_ticks = OSGetTime();
+    store_transfer_result(state, &job->transfer_result);
+}
+
+static void finish_install(AssistantState *state, bool success)
+{
+    AssistantInstallContext *job = &g_install;
+    if (job->submitted && !g_install_completed) return;
+    __sync_synchronize();
+    if (!g_procui_exit_requested) {
+        record_install_telemetry(state, success ? "install-complete" : "install-failed",
+            &job->action, job->action.type == ASSISTANT_UI_ACTION_INSTALL_TO_USB ? "USB" : "NAND",
+            success ? "installed" : "failed", state->status, job->event_id, job->observed_title_id, NULL);
+        complete_install_result(state, job, success);
+    }
+    if (job->callback_context) OSFreeToSystem(job->callback_context);
+    if (job->install_path) OSFreeToSystem(job->install_path);
+    if (job->path_vector) OSFreeToSystem(job->path_vector);
+    if (job->progress) OSFreeToSystem(job->progress);
+    if (job->install_info) OSFreeToSystem(job->install_info);
+    if (job->handle >= 0) MCP_Close(job->handle);
+    state->install_active = false;
+    g_storage_revision++;
+    assistant_ui_set_install_active(false);
+    if (!g_procui_exit_requested) OSEnableHomeButtonMenu(job->home_was_enabled);
+    memset(job, 0, sizeof(*job));
+}
+
+static void tick_install(AssistantState *state)
+{
+    if (!state->install_active) return;
+    AssistantInstallContext *job = &g_install;
+    uint64_t now = OSTicksToMilliseconds(OSGetTime());
+    AssistantInstallStep step = assistant_install_step(&job->lifecycle, now, g_install_completed, g_procui_exit_requested);
+    if (step == ASSISTANT_INSTALL_ABORT) {
+        MCP_InstallTitleAbort(job->handle);
+        copy_text(job->failure, sizeof(job->failure),
+            g_procui_exit_requested ? "Install canceled: app is exiting."
+                : "Install timed out. Canceling safely; keep the console on. The package remains on SD.");
+        set_status(state, job->failure);
+    } else if (step == ASSISTANT_INSTALL_FINISH) {
+        __sync_synchronize();
+        bool success = !job->lifecycle.abort_requested && g_install_error == 0;
+        char status[UIF_MAX_TEXT];
+        if (job->lifecycle.abort_requested) copy_text(status, sizeof(status), job->failure);
+        else if (!success) snprintf(status, sizeof(status), "Install failed: 0x%08X. %s", (uint32_t)g_install_error, install_error_hint(g_install_error));
+        else {
+            char name[80];
+            copy_display_name(name, sizeof(name), job->action.package_name);
+            snprintf(status, sizeof(status), "Installed %s to %s.", name,
+                job->action.type == ASSISTANT_UI_ACTION_INSTALL_TO_USB ? "USB" : "NAND");
+        }
+        set_status(state, status);
+        finish_install(state, success);
+    } else if (step == ASSISTANT_INSTALL_POLL) {
+        memset(job->progress, 0, sizeof(*job->progress));
+        if (MCP_InstallGetProgress(job->handle, job->progress) == 0) {
+            assistant_install_progress(&job->lifecycle, now, job->progress->sizeProgress);
+            state->install_done_bytes = (long long)job->progress->sizeProgress;
+            state->install_total_bytes = (long long)job->progress->sizeTotal;
+            if (job->progress->tid) job->observed_title_id = job->progress->tid;
+        }
+        if (now - job->last_render_ms >= 1000) {
+            if (!state->receiving_file) {
+                char done[32], total[32], name[80];
+                format_byte_count(state->install_done_bytes, done, sizeof(done));
+                format_byte_count(state->install_total_bytes, total, sizeof(total));
+                copy_display_name(name, sizeof(name), job->action.package_name);
+                snprintf(state->status, sizeof(state->status), "Installing %s: %s / %s.", name, done, total);
+            }
+            render_assistant_screen(state);
+            job->last_render_ms = now;
+        }
+    }
+}
+
 static bool perform_install_action(AssistantState *state, const AssistantUiAction *action, bool automatic)
 {
-    if (!state || !action || action->type == ASSISTANT_UI_ACTION_NONE)
+    if (!state || !action || action->type == ASSISTANT_UI_ACTION_NONE || state->install_active)
         return false;
 
     if (!state->install_enabled
@@ -4350,6 +4506,12 @@ static bool perform_install_action(AssistantState *state, const AssistantUiActio
         return false;
     }
 
+    AssistantInstallContext *job = &g_install;
+    memset(job, 0, sizeof(*job));
+    job->action = *action;
+    job->automatic = automatic;
+    job->handle = -1;
+    if (automatic) job->transfer_result = state->pending_install_result;
     bool to_usb = action->type == ASSISTANT_UI_ACTION_INSTALL_TO_USB;
     const char *target_text = to_usb ? "USB" : "NAND";
     char package_display_name[80];
@@ -4358,7 +4520,7 @@ static bool perform_install_action(AssistantState *state, const AssistantUiActio
     char mcp_package_path[UIF_MAX_PATH];
     char error[UIF_MAX_TEXT];
     char status[UIF_MAX_TEXT];
-    char install_event_id[64] = {0};
+    char *install_event_id = job->event_id;
     snprintf(status, sizeof(status), "Installing %s to %s.", package_display_name, target_text);
     record_install_telemetry(
         state,
@@ -4395,7 +4557,19 @@ static bool perform_install_action(AssistantState *state, const AssistantUiActio
         return false;
     }
 
-    bool home_was_enabled = OSIsHomeButtonMenuEnabled();
+    AssistantPackagePolicy policy = assistant_policy_read(fs_package_path);
+    if (policy == ASSISTANT_POLICY_INVALID || (to_usb && policy == ASSISTANT_POLICY_NAND))
+    {
+        set_status(state, policy == ASSISTANT_POLICY_INVALID
+            ? "Install requirements do not match this package. Resend it from UIF."
+            : "This package requires internal storage (NAND), not USB.");
+        record_install_telemetry(state, "install-failed", action, target_text,
+            "failed", state->status, install_event_id, 0, NULL);
+        complete_install_result(state, job, false);
+        return false;
+    }
+
+    job->home_was_enabled = OSIsHomeButtonMenuEnabled();
     OSEnableHomeButtonMenu(false);
     state->install_active = true;
     state->install_done_bytes = 0;
@@ -4404,11 +4578,7 @@ static bool perform_install_action(AssistantState *state, const AssistantUiActio
     set_status(state, status);
     render_assistant_screen(state);
 
-    bool install_succeeded = false;
-    bool async_submitted = false;
-    bool abort_requested = false;
-    uint64_t observed_title_id = 0;
-    MCPError handle = MCP_Open();
+    MCPError handle = job->handle = MCP_Open();
     if (handle < 0)
     {
         snprintf(status, sizeof(status), "Install failed: MCP open returned %d.", handle);
@@ -4425,15 +4595,16 @@ static bool perform_install_action(AssistantState *state, const AssistantUiActio
             NULL);
         state->install_active = false;
         assistant_ui_set_install_active(false);
-        OSEnableHomeButtonMenu(home_was_enabled);
+        OSEnableHomeButtonMenu(job->home_was_enabled);
+        complete_install_result(state, job, false);
         return false;
     }
 
-    MCPInstallInfo *install_info = (MCPInstallInfo *)OSAllocFromSystem(sizeof(MCPInstallInfo), 0x40);
-    MCPInstallProgress *progress = (MCPInstallProgress *)OSAllocFromSystem(sizeof(MCPInstallProgress), 0x40);
-    IOSVec *path_vector = (IOSVec *)OSAllocFromSystem(sizeof(IOSVec), 0x40);
-    char *install_path = (char *)OSAllocFromSystem(UIF_MCP_INSTALL_PATH_LENGTH, 0x40);
-    uint32_t *callback_context = (uint32_t *)OSAllocFromSystem(0x24, 0x40);
+    MCPInstallInfo *install_info = job->install_info = (MCPInstallInfo *)OSAllocFromSystem(sizeof(MCPInstallInfo), 0x40);
+    MCPInstallProgress *progress = job->progress = (MCPInstallProgress *)OSAllocFromSystem(sizeof(MCPInstallProgress), 0x40);
+    IOSVec *path_vector = job->path_vector = (IOSVec *)OSAllocFromSystem(sizeof(IOSVec), 0x40);
+    char *install_path = job->install_path = (char *)OSAllocFromSystem(UIF_MCP_INSTALL_PATH_LENGTH, 0x40);
+    uint32_t *callback_context = job->callback_context = (uint32_t *)OSAllocFromSystem(0x24, 0x40);
 
     if (!install_info || !progress || !path_vector || !install_path || !callback_context)
     {
@@ -4497,181 +4668,13 @@ static bool perform_install_action(AssistantState *state, const AssistantUiActio
         set_status(state, status);
         goto cleanup;
     }
-    async_submitted = true;
-
-    int last_percent = -1;
-    uint64_t install_started_ticks = OSGetTime();
-    uint64_t last_progress_ticks = install_started_ticks;
-    uint64_t last_progress_read_ticks = install_started_ticks;
-    uint64_t last_render_ticks = 0;
-    uint64_t last_progress_bytes = 0;
-    while (!g_install_completed && !g_procui_exit_requested && WHBProcIsRunning())
-    {
-        memset(progress, 0, sizeof(MCPInstallProgress));
-        MCPError progress_result = MCP_InstallGetProgress(handle, progress);
-        uint64_t now = OSGetTime();
-        if (progress_result == 0)
-        {
-            state->install_done_bytes = (long long)progress->sizeProgress;
-            state->install_total_bytes = (long long)progress->sizeTotal;
-            if (progress->tid != 0)
-                observed_title_id = progress->tid;
-            last_progress_read_ticks = now;
-            if (progress->sizeProgress > last_progress_bytes)
-            {
-                last_progress_bytes = progress->sizeProgress;
-                last_progress_ticks = now;
-            }
-        }
-
-        if (now - install_started_ticks >= OSMillisecondsToTicks(UIF_INSTALL_MAX_RUNTIME_MS))
-        {
-            MCP_InstallTitleAbort(handle);
-            abort_requested = true;
-            set_status(state, "Install stopped after 90 minutes. The package remains on SD for a manual retry.");
-            goto cleanup;
-        }
-
-        if (now - last_progress_ticks >= OSMillisecondsToTicks(UIF_INSTALL_STALL_TIMEOUT_MS)
-            || now - last_progress_read_ticks >= OSMillisecondsToTicks(UIF_INSTALL_STALL_TIMEOUT_MS))
-        {
-            MCP_InstallTitleAbort(handle);
-            abort_requested = true;
-            set_status(state, "Install stopped after 15 minutes without readable progress. Check storage, package files, and free space.");
-            goto cleanup;
-        }
-
-        int percent = 0;
-        if (progress_result == 0 && progress->sizeTotal > 0)
-            percent = (int)((progress->sizeProgress * 100ULL) / progress->sizeTotal);
-        if (percent > 100)
-            percent = 100;
-
-        if (percent != last_percent || now - last_render_ticks >= OSMillisecondsToTicks(1000))
-        {
-            if (progress_result == 0)
-            {
-                char done[32];
-                char total[32];
-                format_byte_count((long long)progress->sizeProgress, done, sizeof(done));
-                format_byte_count((long long)progress->sizeTotal, total, sizeof(total));
-                snprintf(status, sizeof(status), "Installing %s to %s: %d%% (%s / %s).", package_display_name, target_text, percent, done, total);
-            }
-            else
-            {
-                snprintf(status, sizeof(status), "Installing %s to %s; waiting for progress (%d).", package_display_name, target_text, progress_result);
-            }
-            copy_text(state->status, sizeof(state->status), status);
-            WHBLogPrintf("%s", state->status);
-            render_assistant_screen(state);
-            last_percent = percent;
-            last_render_ticks = now;
-        }
-
-        assistant_ui_poll_input();
-        OSSleepTicks(OSMillisecondsToTicks(250));
-    }
-
-    if (g_procui_exit_requested || !WHBProcIsRunning())
-    {
-        g_procui_exit_requested = true;
-        MCP_InstallTitleAbort(handle);
-        abort_requested = true;
-        set_status(state, "Install canceled: app is exiting.");
-        goto cleanup;
-    }
-
-    __sync_synchronize();
-    if (g_install_error != 0)
-    {
-        snprintf(
-            status,
-            sizeof(status),
-            "Install failed: 0x%08X. %s",
-            (uint32_t)g_install_error,
-            install_error_hint(g_install_error));
-        set_status(state, status);
-        goto cleanup;
-    }
-
-    snprintf(status, sizeof(status), "Installed %s to %s.", package_display_name, target_text);
-    set_status(state, status);
-    install_succeeded = true;
+    job->submitted = true;
+    assistant_install_begin(&job->lifecycle, OSTicksToMilliseconds(OSGetTime()));
+    return true;
 
 cleanup:
-    copy_text(status, sizeof(status), state->status);
-    if (async_submitted && !g_install_completed)
-    {
-        if (!abort_requested)
-            MCP_InstallTitleAbort(handle);
-        uint64_t wait_started = OSGetTime();
-        uint64_t last_wait_render = 0;
-        // Abort requests are asynchronous too. The IOS callback still owns the
-        // request buffers until it completes, even after the HOME exit callback.
-        while (!g_install_completed)
-        {
-            if (!g_procui_exit_requested && !WHBProcIsRunning())
-                g_procui_exit_requested = true;
-            uint64_t now = OSGetTime();
-            if (g_procui_exit_requested)
-            {
-                if (now - wait_started >= OSMillisecondsToTicks(5000))
-                    break;
-            }
-            else
-            {
-                assistant_ui_poll_input();
-                if (now - last_wait_render >= OSMillisecondsToTicks(1000))
-                {
-                    copy_text(state->status, sizeof(state->status), "Canceling installation. Keep the console on.");
-                    render_assistant_screen(state);
-                    last_wait_render = now;
-                }
-            }
-            OSSleepTicks(OSMillisecondsToTicks(50));
-        }
-    }
-
-    bool buffers_can_release = !async_submitted || g_install_completed;
-    if (!buffers_can_release)
-    {
-        // Only an external process-exit request can take this path. Leave the
-        // outstanding IOS buffers and handle alive for process reclamation.
-        return false;
-    }
-    __sync_synchronize();
-    if (!g_procui_exit_requested)
-    {
-        copy_text(state->status, sizeof(state->status), status);
-        record_install_telemetry(
-            state,
-            install_succeeded ? "install-complete" : "install-failed",
-            action,
-            target_text,
-            install_succeeded ? "installed" : "failed",
-            state->status,
-            install_event_id,
-            observed_title_id,
-            NULL);
-    }
-
-    if (callback_context)
-        OSFreeToSystem(callback_context);
-    if (install_path)
-        OSFreeToSystem(install_path);
-    if (path_vector)
-        OSFreeToSystem(path_vector);
-    if (progress)
-        OSFreeToSystem(progress);
-    if (install_info)
-        OSFreeToSystem(install_info);
-    MCP_Close(handle);
-    state->install_active = false;
-    g_storage_revision++;
-    assistant_ui_set_install_active(false);
-    if (!g_procui_exit_requested)
-        OSEnableHomeButtonMenu(home_was_enabled);
-    return install_succeeded;
+    finish_install(state, false);
+    return false;
 }
 
 static int append_install_packages(char *json, size_t json_size, size_t *offset, const AssistantState *state)
@@ -4920,7 +4923,7 @@ static void handle_log(int fd, AssistantState *state, const HttpRequest *request
 static void handle_request(int fd, AssistantState *state)
 {
     HttpRequest request;
-    if (!parse_http_request(fd, &request))
+    if (!parse_http_request(fd, &request, (state->install_active || state->receiving_file) ? 500 : 10000))
     {
         state->http_request_count++;
         copy_text(state->last_http_request, sizeof(state->last_http_request), "unparsed request");
@@ -4936,6 +4939,15 @@ static void handle_request(int fd, AssistantState *state)
         "%.11s %.100s",
         request.method,
         request.path);
+
+    // During an upload, nested servicing is read-only and cannot invalidate file pointers.
+    // Install-time writes are restricted to the separate transfer staging transaction.
+    if ((state->receiving_file && !assistant_request_allowed_during_install(request.method, request.path))
+        || (state->install_active && !assistant_request_allowed_with_install(request.method, request.path)))
+    {
+        send_message(fd, 409, "Conflict", "This operation is busy. Status remains available; title changes must wait.");
+        return;
+    }
 
     if (strcmp(request.method, "GET") == 0 && (strcmp(request.path, "/") == 0 || strcmp(request.path, "/index.html") == 0))
     {
@@ -5071,7 +5083,7 @@ static int start_server_socket(int port)
     return fd;
 }
 
-static void set_socket_timeouts(int fd)
+static void set_socket_timeouts(int fd, bool installing)
 {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0)
@@ -5079,13 +5091,33 @@ static void set_socket_timeouts(int fd)
 
 #if defined(SO_RCVTIMEO) && defined(SO_SNDTIMEO)
     struct timeval timeout;
-    timeout.tv_sec = 5;
-    timeout.tv_usec = 0;
+    timeout.tv_sec = installing ? 0 : 5;
+    timeout.tv_usec = installing ? 250000 : 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 #else
     (void)fd;
+    (void)installing;
 #endif
+}
+
+static void service_install_status_request(AssistantState *state)
+{
+    if (state->server_fd < 0 || g_procui_exit_requested)
+        return;
+    fd_set ready;
+    FD_ZERO(&ready);
+    FD_SET(state->server_fd, &ready);
+    struct timeval timeout = {0, 0};
+    if (select(state->server_fd + 1, &ready, NULL, NULL, &timeout) <= 0)
+        return;
+    int client_fd = accept(state->server_fd, NULL, NULL);
+    if (client_fd < 0)
+        return;
+    // At most one short control request per install tick, with a bounded header read.
+    set_socket_timeouts(client_fd, true);
+    handle_request(client_fd, state);
+    close(client_fd);
 }
 
 static bool wait_for_client(int server_fd)
@@ -5460,7 +5492,7 @@ int main(int argc, char **argv)
             }
         }
 
-        if (initialized)
+        if (initialized && !state.install_active)
         {
             AssistantUiAction action;
             if (assistant_ui_take_action(&action))
@@ -5507,26 +5539,18 @@ int main(int argc, char **argv)
             }
         }
 
-        if (initialized && state.auto_install_pending)
+        if (initialized) tick_install(&state);
+        if (initialized && state.auto_install_pending && !state.install_active)
         {
             AssistantUiAction action = state.auto_install_action;
             state.auto_install_pending = false;
             memset(&state.auto_install_action, 0, sizeof(state.auto_install_action));
-            bool install_succeeded = perform_install_action(&state, &action, true);
-            if (g_procui_exit_requested)
-                break;
-            if (state.last_transfer_result.has_result
-                && equals_ignore_case(state.last_transfer_result.post_transfer_action, "auto-install-after-validation"))
-            {
-                state.last_transfer_result.success = install_succeeded;
-                copy_text(
-                    state.last_transfer_result.status,
-                    sizeof(state.last_transfer_result.status),
-                    install_succeeded ? "installed" : "install-failed");
-                copy_text(
-                    state.last_transfer_result.message,
-                    sizeof(state.last_transfer_result.message),
-                    state.status);
+            if (!perform_install_action(&state, &action, true)) {
+                AssistantTransferResult failed = state.pending_install_result;
+                failed.success = false;
+                copy_text(failed.status, sizeof(failed.status), "install-failed");
+                copy_text(failed.message, sizeof(failed.message), state.status);
+                store_transfer_result(&state, &failed);
             }
             render_assistant_screen(&state);
         }
@@ -5547,7 +5571,7 @@ int main(int argc, char **argv)
             int client_fd = accept(state.server_fd, (struct sockaddr *)&client_address, &client_length);
             if (client_fd >= 0)
             {
-                set_socket_timeouts(client_fd);
+                set_socket_timeouts(client_fd, false);
                 handle_request(client_fd, &state);
                 close(client_fd);
                 if (g_procui_exit_requested)
@@ -5584,6 +5608,12 @@ int main(int argc, char **argv)
      * matching the lifecycle that passed the earlier hardware close test.
      * Keep explicit cleanup only for a future non-ProcUI exit path.
      */
+    if (state.install_active)
+    {
+        g_procui_exit_requested = true;
+        tick_install(&state);
+        // An outstanding IOS callback owns its buffers; process teardown reclaims them.
+    }
     if (!g_procui_exit_requested)
     {
         WHBLogPrintf("Exiting UInjectForge Assistant.");

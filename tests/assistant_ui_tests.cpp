@@ -78,6 +78,8 @@ void reset_navigation()
 {
     installActive = false;
     simpleUi = false;
+    dashboardOpen = false;
+    startupActive = false;
     contentFocused = false;
     installConfirmOpen = false;
     launchConfirmOpen = false;
@@ -198,6 +200,27 @@ void navigation_tests()
     cachedInstallGloballyEnabled = false;
     handle_navigation_buttons(VPAD_BUTTON_X);
     assert(!autoInstallConfirmOpen && !assistant_ui_take_action(&action));
+
+    reset_navigation();
+    simpleUi = true;
+    handle_navigation_buttons(VPAD_BUTTON_Y);
+    assert(dashboardOpen && !simpleUi && selectedPage == PackagesPageIndex);
+    assert(!contentFocused && !assistant_ui_take_action(&action));
+    handle_touch_command({{}, TouchCommand::Receiver, 0});
+    assert(!dashboardOpen && simpleUi);
+    handle_touch_command({{}, TouchCommand::Dashboard, 0});
+    assert(dashboardOpen && !simpleUi);
+    installActive = true;
+    handle_navigation_buttons(VPAD_BUTTON_Y);
+    handle_touch_command({{}, TouchCommand::Receiver, 0});
+    assert(dashboardOpen && !assistant_ui_take_action(&action));
+    installActive = false;
+    handle_navigation_buttons(VPAD_BUTTON_Y);
+    startupActive = true;
+    handle_touch_command({{}, TouchCommand::Dashboard, 0});
+    handle_navigation_buttons(VPAD_BUTTON_Y);
+    assert(simpleUi && !dashboardOpen && !assistant_ui_take_action(&action));
+    startupActive = false;
 }
 
 void touch_tests()
@@ -252,6 +275,16 @@ void input_adapter_tests()
         hasKpad = true;
         assert(assistant_ui_poll_input());
         assert(selectedPage == 1 && !contentFocused);
+        simpleUi = true;
+        if (extension == WPAD_EXT_PRO_CONTROLLER)
+            fakeKpad.pro.trigger = WPAD_PRO_BUTTON_Y;
+        else if (extension == WPAD_EXT_CLASSIC || extension == WPAD_EXT_MPLUS_CLASSIC)
+            fakeKpad.classic.trigger = WPAD_CLASSIC_BUTTON_Y;
+        else
+            fakeKpad.trigger = WPAD_BUTTON_2;
+        hasKpad = true;
+        assert(assistant_ui_poll_input());
+        assert(dashboardOpen && !simpleUi && selectedPage == PackagesPageIndex && !contentFocused);
     }
 
     reset_navigation();
@@ -393,6 +426,28 @@ void render_tests(const char *output)
     std::ofstream(fixtures / "install" / "Game One" / "title.cert") << "fixture";
     assistant_ui_invalidate_storage();
 
+    const auto packageRoot = (fixtures / "install" / "Game One").string();
+    assert(assistant_policy_write(packageRoot.c_str(), true));
+    assistant_ui_render(&model);
+    assert(cachedPackagePolicies.at("Game One") == ASSISTANT_POLICY_NAND);
+    installConfirmOpen = true;
+    selectedInstallTarget = 1;
+    assistant_ui_render(&model);
+    assert(selectedInstallTarget == 0);
+    installConfirmOpen = false;
+    std::ofstream(fixtures / "install" / "Game One" / "title.tmd", std::ios::app) << "replacement";
+    assistant_ui_invalidate_storage();
+    assistant_ui_render(&model);
+    assert(cachedPackagePolicies.at("Game One") == ASSISTANT_POLICY_INVALID);
+    installConfirmOpen = true;
+    pendingAction.type = ASSISTANT_UI_ACTION_NONE;
+    assistant_ui_render(&model);
+    handle_navigation_buttons(VPAD_BUTTON_A);
+    assert(pendingAction.type == ASSISTANT_UI_ACTION_NONE && installConfirmOpen);
+    installConfirmOpen = false;
+    assert(assistant_policy_write(packageRoot.c_str(), false));
+    assistant_ui_invalidate_storage();
+
     for (auto size : {std::pair<int, int>{854, 480}, {1280, 720}, {1920, 1080}, {640, 480}})
     {
         SDL_SetWindowSize(window, size.first, size.second);
@@ -427,6 +482,17 @@ void render_tests(const char *output)
         model.simple_ui = true;
         assistant_ui_render(&model);
         save_frame(std::filesystem::path(output) / (std::to_string(size.first) + "-simple.bmp"));
+        assert(std::any_of(touchTargets.begin(), touchTargets.end(), [](const auto &target) {
+            return target.command == TouchCommand::Dashboard;
+        }));
+        handle_touch_command({{}, TouchCommand::Dashboard, 0});
+        assistant_ui_render(&model);
+        assert(dashboardOpen && !simpleUi && selectedPage == PackagesPageIndex);
+        assert(!contentFocused && !installConfirmOpen && pendingAction.type == ASSISTANT_UI_ACTION_NONE);
+        save_frame(std::filesystem::path(output) / (std::to_string(size.first) + "-dashboard.bmp"));
+        handle_navigation_buttons(VPAD_BUTTON_Y);
+        assistant_ui_render(&model);
+        assert(simpleUi && !dashboardOpen);
         handle_navigation_buttons(VPAD_BUTTON_X);
         assistant_ui_render(&model);
         save_frame(std::filesystem::path(output) / (std::to_string(size.first) + "-auto-install-confirm.bmp"));
@@ -438,6 +504,7 @@ void render_tests(const char *output)
         std::snprintf(model.status, sizeof(model.status), "Connecting network.");
         assistant_ui_render(&model);
         save_frame(std::filesystem::path(output) / (std::to_string(size.first) + "-startup.bmp"));
+        assert(touchTargets.empty());
         model.startup_active = false;
         model.install_enabled = true;
         model.simple_ui = false;

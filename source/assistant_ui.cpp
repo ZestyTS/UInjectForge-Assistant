@@ -1,5 +1,6 @@
 #include "assistant_ui.h"
 #include "assistant_storage.h"
+#include "assistant_policy.h"
 
 #include <algorithm>
 #include <array>
@@ -52,6 +53,8 @@ bool autoInstallConfirmOpen = false;
 bool contentFocused = false;
 bool installActive = false;
 bool simpleUi = false;
+bool dashboardOpen = false;
+bool startupActive = false;
 bool touchHeld = false;
 bool cachedInstallEnabled = false;
 bool cachedInstallGloballyEnabled = false;
@@ -65,6 +68,7 @@ bool installedTitlesUsbReadable = false;
 AssistantUiAction pendingAction{};
 std::vector<std::string> cachedInstallPackages;
 std::map<std::string, std::string> cachedPackageValidation;
+std::map<std::string, AssistantPackagePolicy> cachedPackagePolicies;
 std::vector<std::string> systemMemoryOnlyPackages;
 std::string cachedSdRoot;
 std::string lastCompletedTransfer;
@@ -151,7 +155,7 @@ constexpr int ConfigPageIndex = 14;
 constexpr int SidebarVisibleCount = 8;
 int sidebarStart = 0;
 
-enum class TouchCommand { Page, SidebarUp, SidebarDown, Enter, Back, Refresh, Package, Title, Previous, Next, Confirm, Nand, Usb, AutoInstall };
+enum class TouchCommand { Page, SidebarUp, SidebarDown, Enter, Back, Refresh, Package, Title, Previous, Next, Confirm, Nand, Usb, AutoInstall, Dashboard, Receiver };
 struct TouchTarget { SDL_Rect rect; TouchCommand command; int value; };
 std::vector<TouchTarget> touchTargets;
 TouchTarget pressedTouch{};
@@ -1001,6 +1005,8 @@ void load_package_snapshot(const AssistantUiModel *model)
         ? cachedInstallPackages[selectedPackageIndex] : "";
     cachedInstallPackages = list_sd_install_packages(model);
     cachedPackageValidation.clear();
+    cachedPackagePolicies.clear();
+    systemMemoryOnlyPackages.clear();
     auto found = std::find(cachedInstallPackages.begin(), cachedInstallPackages.end(), selected);
     selectedPackageIndex = found == cachedInstallPackages.end() ? 0 : static_cast<int>(found - cachedInstallPackages.begin());
     packagesLoaded = true;
@@ -1015,6 +1021,7 @@ const std::string &package_validation(const AssistantUiModel *model, const std::
     char packagePath[512];
     join_path(installPath, sizeof(installPath), model->sd_root, "install");
     join_path(packagePath, sizeof(packagePath), installPath, package.c_str());
+    cachedPackagePolicies[package] = assistant_policy_read(packagePath);
     return cachedPackageValidation.emplace(package, build_install_package_validation(packagePath)).first->second;
 }
 
@@ -1538,8 +1545,9 @@ int list_start(int selected, int count)
 bool selected_package_requires_nand()
 {
     return selectedPackageIndex >= 0 && selectedPackageIndex < static_cast<int>(cachedInstallPackages.size())
-        && std::find(systemMemoryOnlyPackages.begin(), systemMemoryOnlyPackages.end(),
-            cachedInstallPackages[selectedPackageIndex]) != systemMemoryOnlyPackages.end();
+        && (cachedPackagePolicies[cachedInstallPackages[selectedPackageIndex]] == ASSISTANT_POLICY_NAND
+            || std::find(systemMemoryOnlyPackages.begin(), systemMemoryOnlyPackages.end(),
+                cachedInstallPackages[selectedPackageIndex]) != systemMemoryOnlyPackages.end());
 }
 
 void draw_list_actions(bool hasItems)
@@ -1661,13 +1669,19 @@ void draw_confirmation()
         bool nandOnly = selected_package_requires_nand();
         if (nandOnly)
             selectedInstallTarget = 0;
-        draw_text(nandOnly ? "Internal storage required" : "Install to", 694, 484, 28, Muted, 950);
+        const auto policy = cachedPackagePolicies[cachedInstallPackages[selectedPackageIndex]];
+        draw_text(nandOnly ? "Internal storage required"
+            : policy == ASSISTANT_POLICY_UNKNOWN ? "Install to (requirements unverified)"
+            : policy == ASSISTANT_POLICY_INVALID ? "Package requirements invalid; resend from UIF."
+            : "Install to", 694, 484, 28, Muted, 950);
         draw_button("NAND", 694, 538, 360, TouchCommand::Nand, 0, selectedInstallTarget == 0);
         draw_button("USB", 1074, 538, 360, TouchCommand::Usb, 0, selectedInstallTarget == 1, !nandOnly);
         draw_text("Keep the console on until installation finishes.", 694, 642, 27, Muted, 930);
     }
     draw_button("Cancel", 1054, 738, 260, TouchCommand::Back);
-    draw_button(installConfirmOpen ? "Install" : "Launch", 1340, 738, 310, TouchCommand::Confirm, 0, true);
+    const bool validPolicy = !installConfirmOpen
+        || cachedPackagePolicies[cachedInstallPackages[selectedPackageIndex]] != ASSISTANT_POLICY_INVALID;
+    draw_button(installConfirmOpen ? "Install" : "Launch", 1340, 738, 310, TouchCommand::Confirm, 0, true, validPolicy);
 }
 
 void draw_auto_install_confirmation()
@@ -1749,7 +1763,7 @@ void draw_config_page(const AssistantUiModel *model)
     draw_metric("HTTP", httpPort, 444, 490, 260);
     draw_metric("UDP", broadcastPort, 740, 490, 300);
     draw_metric("UDP discovery", model->broadcast_enabled ? "enabled" : "off", 1076, 490, 300);
-    draw_metric("UI", model->simple_ui ? "simple" : "full", 1412, 490, 360);
+    draw_metric("UI", simpleUi ? "receiver" : "dashboard", 1412, 490, 360);
 
     draw_text(model->manual_install_enabled ? "Manual install: enabled" : "Manual install: disabled", 444, 610, 28, model->manual_install_enabled ? Ready : Muted, 620);
     draw_button(
@@ -1820,6 +1834,8 @@ void draw_simple_ui(const AssistantUiModel *model)
     draw_panel(54, 530, 1812, 292, model->transfer_active ? Accent : Border);
     draw_text("Transfer", 92, 570, 42, White, 420);
     draw_text(model->transfer_active ? safe(model->package_display_name) : "Waiting for UIF", 92, 630, 36, White, 1150);
+    if (!model->startup_active)
+        draw_button("Packages & tools", 1410, 566, 396, TouchCommand::Dashboard);
     char files[80];
     std::snprintf(files, sizeof(files), "%d / %d files", model->uploaded_files, model->file_count);
     char uploaded[32];
@@ -1842,6 +1858,8 @@ void draw_simple_ui(const AssistantUiModel *model)
     if (!model->startup_active)
         draw_text("X Auto install", 330, 1022, 27, Dim, 330);
     draw_text("HOME Menu", model->startup_active ? 330 : 690, 1022, 27, Dim, 280);
+    if (!model->startup_active)
+        draw_text("Y / Wii Remote 2: Packages & tools", 1040, 1022, 27, Dim, 790);
     if (autoInstallConfirmOpen)
         draw_auto_install_confirmation();
     SDL_RenderPresent(renderer);
@@ -1929,7 +1947,8 @@ extern "C" void assistant_ui_render(const AssistantUiModel *model)
     cachedInstallGloballyEnabled = model->install_enabled;
     cachedAutoInstallEnabled = model->auto_install_enabled;
     installActive = model->install_active;
-    simpleUi = model->simple_ui;
+    startupActive = model->startup_active;
+    simpleUi = model->simple_ui && !dashboardOpen;
     touchTargets.clear();
     if (cachedSdRoot != model->sd_root)
     {
@@ -1949,7 +1968,7 @@ extern "C" void assistant_ui_render(const AssistantUiModel *model)
 
     update_render_metrics(model->ui_scale);
 
-    if (model->simple_ui && !installActive)
+    if (simpleUi && !installActive)
     {
         draw_simple_ui(model);
         return;
@@ -2041,6 +2060,8 @@ extern "C" void assistant_ui_render(const AssistantUiModel *model)
         draw_text(contentFocused ? "A Choose    B Back" : "A Open", 454, 1022, 30, Muted, 400);
         draw_text("X Refresh", 920, 1022, 30, Muted, 240);
         draw_text("HOME Menu", 1190, 1022, 30, Muted, 260);
+        if (dashboardOpen)
+            draw_button("Y Receiver", 1530, 1010, 300, TouchCommand::Receiver);
         if (selectedPage != PackagesPageIndex && selectedPage != InstalledTitlesPageIndex)
             draw_button("Refresh", 1620, 912, 210, TouchCommand::Refresh);
         if (installConfirmOpen || launchConfirmOpen)
@@ -2071,7 +2092,7 @@ void select_page(int page)
 
 bool handle_navigation_buttons(uint32_t trigger)
 {
-    if (!trigger || installActive)
+    if (!trigger || installActive || startupActive)
         return false;
 
     if ((trigger & VPAD_BUTTON_B) != 0)
@@ -2105,6 +2126,13 @@ bool handle_navigation_buttons(uint32_t trigger)
 
     if (simpleUi)
     {
+        if ((trigger & VPAD_BUTTON_Y) != 0)
+        {
+            dashboardOpen = true;
+            simpleUi = false;
+            select_page(PackagesPageIndex);
+            return true;
+        }
         if ((trigger & VPAD_BUTTON_X) != 0 && cachedInstallGloballyEnabled)
         {
             autoInstallConfirmOpen = true;
@@ -2118,6 +2146,9 @@ bool handle_navigation_buttons(uint32_t trigger)
 
     if (installConfirmOpen || launchConfirmOpen)
     {
+        if (installConfirmOpen && (trigger & VPAD_BUTTON_A) != 0
+            && cachedPackagePolicies[cachedInstallPackages[selectedPackageIndex]] == ASSISTANT_POLICY_INVALID)
+            return true;
         if (installConfirmOpen && (trigger & (VPAD_BUTTON_LEFT | VPAD_BUTTON_RIGHT)) != 0)
             selectedInstallTarget = selected_package_requires_nand() ? 0 : 1 - selectedInstallTarget;
         else if ((trigger & VPAD_BUTTON_A) != 0)
@@ -2141,6 +2172,14 @@ bool handle_navigation_buttons(uint32_t trigger)
             launchConfirmOpen = false;
         }
         refreshRequested = true;
+        return true;
+    }
+
+    if ((trigger & VPAD_BUTTON_Y) != 0 && dashboardOpen)
+    {
+        dashboardOpen = false;
+        simpleUi = true;
+        select_page(0);
         return true;
     }
 
@@ -2197,10 +2236,14 @@ bool handle_navigation_buttons(uint32_t trigger)
 
 void handle_touch_command(const TouchTarget &target)
 {
-    if (installActive)
+    if (installActive || startupActive)
         return;
     switch (target.command)
     {
+        case TouchCommand::Dashboard:
+        case TouchCommand::Receiver:
+            handle_navigation_buttons(VPAD_BUTTON_Y);
+            break;
         case TouchCommand::Page:
             select_page(target.value);
             break;
@@ -2348,6 +2391,8 @@ extern "C" bool assistant_ui_poll_input(void)
                 normalized |= VPAD_BUTTON_RIGHT;
             if ((kpad.trigger & WPAD_BUTTON_1) != 0)
                 normalized |= VPAD_BUTTON_X;
+            if ((kpad.trigger & WPAD_BUTTON_2) != 0)
+                normalized |= VPAD_BUTTON_Y;
 
             if (kpad.extensionType == WPAD_EXT_CLASSIC || kpad.extensionType == WPAD_EXT_MPLUS_CLASSIC)
             {
@@ -2366,6 +2411,8 @@ extern "C" bool assistant_ui_poll_input(void)
                     normalized |= VPAD_BUTTON_RIGHT;
                 if ((kpad.classic.trigger & WPAD_CLASSIC_BUTTON_X) != 0)
                     normalized |= VPAD_BUTTON_X;
+                if ((kpad.classic.trigger & WPAD_CLASSIC_BUTTON_Y) != 0)
+                    normalized |= VPAD_BUTTON_Y;
             }
 
             if (kpad.extensionType == WPAD_EXT_PRO_CONTROLLER)
@@ -2385,6 +2432,8 @@ extern "C" bool assistant_ui_poll_input(void)
                     normalized |= VPAD_BUTTON_RIGHT;
                 if ((kpad.pro.trigger & WPAD_PRO_BUTTON_X) != 0)
                     normalized |= VPAD_BUTTON_X;
+                if ((kpad.pro.trigger & WPAD_PRO_BUTTON_Y) != 0)
+                    normalized |= VPAD_BUTTON_Y;
             }
 
             if (handle_navigation_buttons(normalized))

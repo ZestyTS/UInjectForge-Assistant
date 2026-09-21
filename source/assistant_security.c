@@ -3,6 +3,35 @@
 #include <stddef.h>
 #include <string.h>
 
+bool assistant_request_allowed_during_install(const char *method, const char *path)
+{
+    if (!method || !path || strcmp(method, "GET") != 0)
+        return false;
+    if (strcmp(path, "/api/v1/status") == 0)
+        return true;
+    const char *prefix = "/api/v1/transfers/";
+    size_t prefix_length = strlen(prefix);
+    return strncmp(path, prefix, prefix_length) == 0
+        && path[prefix_length] != '\0'
+        && strchr(path + prefix_length, '/') == NULL;
+}
+
+bool assistant_request_allowed_with_install(const char *method, const char *path)
+{
+    if (!method || !path) return false;
+    if (assistant_request_allowed_during_install(method, path)) return true;
+    if (strcmp(method, "POST") == 0
+        && (strcmp(path, "/api/v1/transfers") == 0 || strcmp(path, "/api/v1/pair") == 0)) return true;
+    const char *prefix = "/api/v1/transfers/";
+    if (strncmp(path, prefix, strlen(prefix)) != 0) return false;
+    const char *id = path + strlen(prefix);
+    const char *suffix = strchr(id, '/');
+    if (!*id || suffix == id) return false;
+    if (!suffix) return strcmp(method, "DELETE") == 0;
+    return (strcmp(method, "PUT") == 0 && strncmp(suffix, "/files/", 7) == 0 && suffix[7])
+        || (strcmp(method, "POST") == 0 && strcmp(suffix, "/commit") == 0);
+}
+
 bool assistant_constant_time_equal(const char *left, const char *right)
 {
     if (!left || !right)

@@ -16,7 +16,7 @@ TOPDIR ?= $(CURDIR)
 APP_NAME := UInjectForge Assistant
 APP_SHORTNAME := UIF Assistant
 APP_AUTHOR := ZestyTS
-UIF_COMPONENT_VERSION ?= 1.0.0-alpha
+UIF_COMPONENT_VERSION ?= 1.0.0-preview.20260921
 UIF_COMPONENT_BUILD_ID ?= dev
 
 ifneq ($(HOST_TEST_ONLY),yes)
@@ -49,12 +49,20 @@ LIBDIRS := $(PORTLIBS) $(WUT_ROOT) $(WUT_ROOT)/usr
 .PHONY: host-test ui-host-test
 ui-host-test:
 	@mkdir -p $(HOST_TEST_BUILD)
+	@$(HOSTCC) -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -Iinclude -c source/assistant_policy.c -o $(HOST_TEST_BUILD)/assistant-policy.o
 	@$(HOSTCC) -std=c11 -Wall -Wextra -Werror -DUIF_ASSISTANT_HOST_TEST -Iinclude -Itests -c source/assistant_storage.c -o $(HOST_TEST_BUILD)/assistant-storage.o
-	@$(HOSTCXX) -std=c++17 -Wall -Wextra -Werror -DUIF_ASSISTANT_HOST_TEST -Iinclude -Itests $$(pkg-config --cflags sdl2 SDL2_ttf) tests/assistant_ui_tests.cpp $(HOST_TEST_BUILD)/assistant-storage.o $$(pkg-config --libs sdl2 SDL2_ttf) -o $(HOST_TEST_BUILD)/assistant-ui-tests
+	@$(HOSTCXX) -std=c++17 -Wall -Wextra -Werror -DUIF_ASSISTANT_HOST_TEST -Iinclude -Itests $$(pkg-config --cflags sdl2 SDL2_ttf) tests/assistant_ui_tests.cpp $(HOST_TEST_BUILD)/assistant-storage.o $(HOST_TEST_BUILD)/assistant-policy.o -lmbedcrypto $$(pkg-config --libs sdl2 SDL2_ttf) -o $(HOST_TEST_BUILD)/assistant-ui-tests
 	@SDL_VIDEODRIVER=dummy $(HOST_TEST_BUILD)/assistant-ui-tests $(HOST_TEST_BUILD)/screenshots
 
 host-test:
 	@mkdir -p $(HOST_TEST_BUILD)
+	@sh tests/run-transfer-results.sh $(UIF_RESULT_FIXTURE)
+	@$(HOSTCC) -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude source/assistant_policy.c tests/assistant_policy_tests.c -lmbedcrypto -o $(HOST_TEST_BUILD)/assistant-policy-tests
+	@$(HOST_TEST_BUILD)/assistant-policy-tests
+	@$(HOSTCC) -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude source/assistant_json.c source/assistant_paths.c tests/assistant_json_tests.c -o $(HOST_TEST_BUILD)/assistant-json-tests
+	@$(HOST_TEST_BUILD)/assistant-json-tests $(UIF_WIRE_FIXTURE)
+	@$(HOSTCC) -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude source/assistant_install.c source/assistant_security.c tests/assistant_install_tests.c -o $(HOST_TEST_BUILD)/assistant-install-tests
+	@$(HOST_TEST_BUILD)/assistant-install-tests
 	@$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iinclude source/assistant_security.c source/assistant_paths.c tests/assistant_security_tests.c -o $(HOST_TEST_BUILD)/assistant-security-tests
 	@$(HOST_TEST_BUILD)/assistant-security-tests
 

@@ -54,6 +54,14 @@ static void test_directory_creation_offsets(void)
 
 int main(void)
 {
+    assert(assistant_request_allowed_during_install("GET", "/api/v1/status"));
+    assert(assistant_request_allowed_during_install("GET", "/api/v1/transfers/abc"));
+    assert(!assistant_request_allowed_during_install("POST", "/api/v1/transfers"));
+    assert(!assistant_request_allowed_during_install("PUT", "/api/v1/transfers/abc/files/content.app"));
+    assert(!assistant_request_allowed_during_install("DELETE", "/api/v1/transfers/abc"));
+    assert(!assistant_request_allowed_during_install("GET", "/api/v1/transfers/"));
+    assert(!assistant_request_allowed_during_install("GET", "/api/v1/titles"));
+    assert(!assistant_request_allowed_during_install(NULL, NULL));
     test_constant_time_compare();
     test_pairing_backoff();
     test_install_permissions();

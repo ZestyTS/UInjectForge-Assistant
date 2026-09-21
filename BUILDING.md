@@ -1,5 +1,23 @@
 # Building the Assistant
 
+## Release Package
+
+From a clean committed checkout, using PowerShell 7.4+ and Docker:
+
+```powershell
+./Scripts/Build-Release.ps1 -Version 1.0.0-preview.20260921
+```
+
+This builds an isolated archive of HEAD, runs host/security/UI tests, and
+cross-compiles with networking disabled. It produces an SD-overlay ZIP, a
+SHA-256 file, and source/toolchain provenance under a new `artifacts` folder.
+It does not publish automatically. GitHub Actions is manual-only to avoid
+unrequested hosted build charges. Publishing must include the exact source tag
+and the package's checksum file; retain prerelease status until hardware checks
+for that package pass.
+
+## Individual Builds
+
 From this repository root, with Docker installed:
 
 ```powershell

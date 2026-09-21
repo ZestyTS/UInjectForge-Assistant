@@ -4,3 +4,5 @@ build-host/
 *.rpx
 *.wuhb
 *.map
+*.build-info.json
+artifacts/
