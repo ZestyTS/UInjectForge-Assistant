@@ -1,5 +1,98 @@
 #include "assistant_json.h"
 #include <stdint.h>
+#include <string.h>
+
+static void whitespace(const char **p) { while (**p == ' ' || **p == '\t' || **p == '\r' || **p == '\n') ++*p; }
+static bool json_string_end(const char **p)
+{
+    char decoded[8192];
+    if (!assistant_json_decode_string(*p, decoded, sizeof(decoded))) return false;
+    ++*p;
+    while (**p && **p != '"') { if (**p == '\\') ++*p; ++*p; }
+    if (**p != '"') return false;
+    ++*p;
+    return true;
+}
+static bool json_value_end(const char **p, unsigned depth)
+{
+    if (depth > 16) return false;
+    whitespace(p);
+    if (**p == '"') return json_string_end(p);
+    if (**p == '{' || **p == '[')
+    {
+        bool object = **p == '{';
+        char end = object ? '}' : ']';
+        ++*p; whitespace(p);
+        if (**p == end) { ++*p; return true; }
+        for (;;)
+        {
+            if (object) {
+                if (!json_string_end(p)) return false;
+                whitespace(p);
+                if (**p != ':') return false;
+                ++*p;
+            }
+            if (!json_value_end(p, depth + 1)) return false;
+            whitespace(p);
+            if (**p == end) { ++*p; return true; }
+            if (**p != ',') return false;
+            ++*p; whitespace(p);
+        }
+    }
+    const char *words[] = {"true", "false", "null"};
+    for (unsigned i = 0; i < 3; i++) if (strncmp(*p, words[i], strlen(words[i])) == 0) {
+        *p += strlen(words[i]); return true;
+    }
+    if (**p == '-') ++*p;
+    if (**p == '0') ++*p;
+    else {
+        if (**p < '1' || **p > '9') return false;
+        do { ++*p; } while (**p >= '0' && **p <= '9');
+    }
+    if (**p == '.') {
+        ++*p;
+        if (**p < '0' || **p > '9') return false;
+        do { ++*p; } while (**p >= '0' && **p <= '9');
+    }
+    if (**p == 'e' || **p == 'E') {
+        ++*p;
+        if (**p == '+' || **p == '-') ++*p;
+        if (**p < '0' || **p > '9') return false;
+        do { ++*p; } while (**p >= '0' && **p <= '9');
+    }
+    return true;
+}
+
+bool assistant_json_object(const char *json, AssistantJsonField *fields, size_t capacity, size_t *count)
+{
+    if (!json || !fields || !count || strlen(json) >= 8192) return false;
+    *count = 0;
+    const char *p = json;
+    whitespace(&p);
+    if (*p++ != '{') return false;
+    whitespace(&p);
+    if (*p != '}') for (;;) {
+        if (*count >= capacity) return false;
+        AssistantJsonField *field = &fields[*count];
+        field->start = p;
+        if (!assistant_json_decode_string(p, field->name, sizeof(field->name)) || !json_string_end(&p)) return false;
+        for (size_t i = 0; i < *count; i++) if (!strcmp(fields[i].name, field->name)) return false;
+        whitespace(&p);
+        if (*p++ != ':') return false;
+        whitespace(&p);
+        field->value = p;
+        if (!json_value_end(&p, 0)) return false;
+        field->value_length = (size_t)(p - field->value);
+        field->length = (size_t)(p - field->start);
+        ++*count;
+        whitespace(&p);
+        if (*p == '}') break;
+        if (*p++ != ',') return false;
+        whitespace(&p);
+    }
+    ++p; whitespace(&p);
+    return *p == 0;
+}
 
 static bool hex_word(const unsigned char **cursor, uint32_t *value)
 {

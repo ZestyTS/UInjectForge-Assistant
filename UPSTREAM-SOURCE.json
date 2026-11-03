@@ -1,0 +1,475 @@
+{
+  "schemaVersion": 1,
+  "status": "SOURCE_PREPARATION_FINAL_PRIMARY_REFRESH_REQUIRED",
+  "upstreamRepository": "ZestyTS/UInjectForge",
+  "upstreamCommit": "6ceff8db586869231966b0521c175bb796c63df7",
+  "upstreamComponent": "tools/UInjectForge.Assistant.WiiU",
+  "componentVersion": "1.0.6",
+  "nativeFingerprintInputCount": 77,
+  "nativeFingerprintInputs": [
+    {
+      "path": "Dockerfile",
+      "gitMode": "100644",
+      "bytes": 138,
+      "sha256": "2ef4ddc6c4da11e7e3207613dbc6b1288f5f5f0a4a395b9e946582b9feda4246"
+    },
+    {
+      "path": "Makefile",
+      "gitMode": "100644",
+      "bytes": 8883,
+      "sha256": "d420d268dc533234ae7fadc95629beb12a63cdbd2c5cf8ec3d0f7aaa03fa87e8"
+    },
+    {
+      "path": "assets/uinjectforge-icon.png",
+      "gitMode": "100644",
+      "bytes": 16540,
+      "sha256": "81da6729912ec9d3de4a7926da9d1ceec755bceb7d7f62abf1af7a9287b85e15"
+    },
+    {
+      "path": "include/assistant_catalog_probe.h",
+      "gitMode": "100644",
+      "bytes": 1265,
+      "sha256": "f22ada4ff40668dd5deddac8a674d96c7518e4398409030b3ab5d081cbfcc41e"
+    },
+    {
+      "path": "include/assistant_ftp.h",
+      "gitMode": "100644",
+      "bytes": 3283,
+      "sha256": "b72e41dba19ba4631be05cdd21fb13078ed516e631ed3448964d91c319b15dab"
+    },
+    {
+      "path": "include/assistant_install.h",
+      "gitMode": "100644",
+      "bytes": 1068,
+      "sha256": "bf15a9c92e250390ca6b185d2160179fb10344448a1ff76552a5553207ddb87c"
+    },
+    {
+      "path": "include/assistant_json.h",
+      "gitMode": "100644",
+      "bytes": 515,
+      "sha256": "319fcbee4d3f36160134637c574221f1d4435e7078d65f4803f29968b5113a8b"
+    },
+    {
+      "path": "include/assistant_pairing.h",
+      "gitMode": "100644",
+      "bytes": 666,
+      "sha256": "069c8058ad84056e0e36fca146fbb6ca82ae7f34edb35429a9213c975fff63a6"
+    },
+    {
+      "path": "include/assistant_paths.h",
+      "gitMode": "100644",
+      "bytes": 290,
+      "sha256": "1713b63d00db8c3eb71338f243973e18610d4113db0bb2f1120e0e0e0d84d278"
+    },
+    {
+      "path": "include/assistant_policy.h",
+      "gitMode": "100644",
+      "bytes": 556,
+      "sha256": "cd546eee3142eb8bb0d4e6e0308140d70c23b39228eb725c2aec9253cdc943f5"
+    },
+    {
+      "path": "include/assistant_power.h",
+      "gitMode": "100644",
+      "bytes": 838,
+      "sha256": "50ad044d6e9f7c7c08c1b1ff5e2431e92e606d65fac317518b97c24bd3fbce05"
+    },
+    {
+      "path": "include/assistant_security.h",
+      "gitMode": "100644",
+      "bytes": 822,
+      "sha256": "3361e037b0a57c7a9564bb6192612c10c718a0289d24058deaa332cb6db24791"
+    },
+    {
+      "path": "include/assistant_settings.h",
+      "gitMode": "100644",
+      "bytes": 1313,
+      "sha256": "04a3ed474a05ae2c8b268a8fafed97a4d6b7a83748af9a1afa82f47e70cc4c39"
+    },
+    {
+      "path": "include/assistant_staged_install.h",
+      "gitMode": "100644",
+      "bytes": 767,
+      "sha256": "1a5175fd17e2373833351e346de0516445b5e5d60c4b4881dc0e50ec921caf5b"
+    },
+    {
+      "path": "include/assistant_storage.h",
+      "gitMode": "100644",
+      "bytes": 929,
+      "sha256": "6d83bb4fead0ec06dfd1cdfb6400282081115be19c4506db4a28519f754385e5"
+    },
+    {
+      "path": "include/assistant_telemetry.h",
+      "gitMode": "100644",
+      "bytes": 1212,
+      "sha256": "0a787d1c73f2979a60cd405c467eec5190da096080249bc7f5e5b98cf929b655"
+    },
+    {
+      "path": "include/assistant_title_folders.h",
+      "gitMode": "100644",
+      "bytes": 1073,
+      "sha256": "c15f30a1dd74a2f4842d74a8672d93369a8f491ff2a67b9b56e02c925cef0423"
+    },
+    {
+      "path": "include/assistant_ui.h",
+      "gitMode": "100644",
+      "bytes": 4290,
+      "sha256": "fe720b27fa4485294e398ac16958e3c13ba93fb9d03cd94a5306fb71f5d202b1"
+    },
+    {
+      "path": "include/assistant_upload.h",
+      "gitMode": "100644",
+      "bytes": 967,
+      "sha256": "19f6037bff3e3e63810f0ef0b35d08414fc5831776bc4c8fb15df25f96a0e054"
+    },
+    {
+      "path": "source/assistant_catalog_probe.c",
+      "gitMode": "100644",
+      "bytes": 4928,
+      "sha256": "a2bdf37942ed3f7ee6a15fa287ed9802dbbf3184618d0a75fb43f4cc2258ce05"
+    },
+    {
+      "path": "source/assistant_ftp.c",
+      "gitMode": "100644",
+      "bytes": 19262,
+      "sha256": "9598ff1622764ab4458de9d734de3b0e991be7aac6f4d3f560c2a053005918be"
+    },
+    {
+      "path": "source/assistant_install.c",
+      "gitMode": "100644",
+      "bytes": 2726,
+      "sha256": "1a298cbe418852d83105d156e0929f76fc2744ab783f84bd6479914c9d3d2a22"
+    },
+    {
+      "path": "source/assistant_json.c",
+      "gitMode": "100644",
+      "bytes": 6729,
+      "sha256": "06b9a100a635bf9fc0b62886d5e474ff27431a620a362a5abb78854ba74a36bb"
+    },
+    {
+      "path": "source/assistant_pairing.c",
+      "gitMode": "100644",
+      "bytes": 4301,
+      "sha256": "92004a4598475a81c6d2992cd11b4a55320a191dbe19e46479ce5efccabb44ed"
+    },
+    {
+      "path": "source/assistant_paths.c",
+      "gitMode": "100644",
+      "bytes": 1268,
+      "sha256": "9079b7e43100a98f15c8fa9b59e6c9b443341785886492ccda8db46db609e6b9"
+    },
+    {
+      "path": "source/assistant_policy.c",
+      "gitMode": "100644",
+      "bytes": 3336,
+      "sha256": "a2618110053336960a8c7a7524604ed018433c56709c4e832861046ea18480cd"
+    },
+    {
+      "path": "source/assistant_power.c",
+      "gitMode": "100644",
+      "bytes": 1373,
+      "sha256": "21330e061d39c4089dc21c29ba67c0981142d311477501f2f5534ecaf5889078"
+    },
+    {
+      "path": "source/assistant_security.c",
+      "gitMode": "100644",
+      "bytes": 2882,
+      "sha256": "c30264917e6fefc7494bdb1225be47b91e4bb716c4c7b185d64796daec9625ac"
+    },
+    {
+      "path": "source/assistant_settings.c",
+      "gitMode": "100644",
+      "bytes": 11674,
+      "sha256": "48636305d07fd0d32ca325fa0c850dea645b683477839c786adcab5758547d0a"
+    },
+    {
+      "path": "source/assistant_staged_install.c",
+      "gitMode": "100644",
+      "bytes": 10567,
+      "sha256": "caa4390181651ba7665fa401e0a783c8665d0d5d737895a684af736877b24ede"
+    },
+    {
+      "path": "source/assistant_storage.c",
+      "gitMode": "100644",
+      "bytes": 6079,
+      "sha256": "6ba716ebb0d944df8d4d6cbe1c2ba669d6b753d2ccfd1f8eea8d3343cca5714c"
+    },
+    {
+      "path": "source/assistant_telemetry.c",
+      "gitMode": "100644",
+      "bytes": 18226,
+      "sha256": "2d7c2217484006ebd2dc3a76a40f0ecbe386d8ff4aaf98cdff1c102f4b7f5965"
+    },
+    {
+      "path": "source/assistant_title_folders.c",
+      "gitMode": "100644",
+      "bytes": 5520,
+      "sha256": "fe8d05a9d5b07fdc85f5d02dc24af0fc871da91c0443fda802fd76baf8faff23"
+    },
+    {
+      "path": "source/assistant_ui.cpp",
+      "gitMode": "100644",
+      "bytes": 99474,
+      "sha256": "f8af5b9f0a241af9034480410486756f26b97d47ea248263e506f375220573c4"
+    },
+    {
+      "path": "source/assistant_upload.c",
+      "gitMode": "100644",
+      "bytes": 936,
+      "sha256": "e27937b577776afa300b40d88c9d9f91fdfa5afc16503ce8b2b4fb33c5600cb7"
+    },
+    {
+      "path": "source/libmocha/LICENSE",
+      "gitMode": "100644",
+      "bytes": 7621,
+      "sha256": "c972628a8d4cb260564d0bb31d6ced8b46266f73fee59f53236a1dfc50c8a5b5"
+    },
+    {
+      "path": "source/libmocha/Makefile",
+      "gitMode": "100644",
+      "bytes": 5522,
+      "sha256": "8c0dc340ca170665e705cea1556e2e265204da6c1317e1252b9b93eb1bd023d8"
+    },
+    {
+      "path": "source/libmocha/README.md",
+      "gitMode": "100644",
+      "bytes": 1330,
+      "sha256": "48af31f96e3b112be526d7b54abb8462657a41bc2e050d0ada0e25c34ec29a5c"
+    },
+    {
+      "path": "source/libmocha/UPSTREAM.md",
+      "gitMode": "100644",
+      "bytes": 1546,
+      "sha256": "7ce749fa01a4de6507f826042548dad2a38dea84be6ff3aa57cd06aec1f33df0"
+    },
+    {
+      "path": "source/libmocha/include/mocha/commands.h",
+      "gitMode": "100644",
+      "bytes": 906,
+      "sha256": "e72f3aca2b3b44549c9bc1d04c3ed6aff92f37265979504edef924e905ce248d"
+    },
+    {
+      "path": "source/libmocha/include/mocha/disc_interface.h",
+      "gitMode": "100644",
+      "bytes": 2397,
+      "sha256": "54fc2a66f42c89e9172391a5fb0c91cbd3054f9c47733917b8cc896cae8009d5"
+    },
+    {
+      "path": "source/libmocha/include/mocha/fsa.h",
+      "gitMode": "100644",
+      "bytes": 3717,
+      "sha256": "8eb59cefe801a103bafccc505ec20a4406a94e4e31a390a03ee9ca18c9ba8a93"
+    },
+    {
+      "path": "source/libmocha/include/mocha/mocha.h",
+      "gitMode": "100644",
+      "bytes": 15851,
+      "sha256": "28140c6f914dc07b5664980e9437f39c6ddadc705c5a763d649858be7966e3e3"
+    },
+    {
+      "path": "source/libmocha/include/mocha/otp.h",
+      "gitMode": "100644",
+      "bytes": 6405,
+      "sha256": "40807361f759c5257762fe7c13420a5ec063b8dda68b06510bab15d8341dbce4"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/MutexWrapper.h",
+      "gitMode": "100644",
+      "bytes": 381,
+      "sha256": "cd6107ce99dfa125d4456ecbc5e645a817353bc3a8367912ebe82114161d391f"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa.cpp",
+      "gitMode": "100644",
+      "bytes": 6949,
+      "sha256": "208a415b2f4646b2001d9b1a8797e6249924eda033b601dca49bf51eb3b7dd3c"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa.h",
+      "gitMode": "100644",
+      "bytes": 3476,
+      "sha256": "df3fdfe3984ab44c7d81206c6b1d45513570cef1ed40ee44331d74a5ad2c4a26"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_chdir.cpp",
+      "gitMode": "100644",
+      "bytes": 763,
+      "sha256": "4e2182026801f3e106e73f6b6d7bb91c8c00e241df99227f096ee870e0f1dfaf"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_chmod.cpp",
+      "gitMode": "100644",
+      "bytes": 923,
+      "sha256": "939e4a52397f49a6551cd79a187d9195d5c2403629c9132589acad84735b0f4b"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_close.cpp",
+      "gitMode": "100644",
+      "bytes": 699,
+      "sha256": "0c4fba7dcadd92befb94cd2eb0fe4d2cc7b61f9be4cd3fe9eb3ff4ab2fe6f90b"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_dirclose.cpp",
+      "gitMode": "100644",
+      "bytes": 769,
+      "sha256": "ac40789409035591f6c3d7e362c4f1586900b452e3aaf64b67968bf50f65b682"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_dirnext.cpp",
+      "gitMode": "100644",
+      "bytes": 1179,
+      "sha256": "2bf7d872690ef8fb11739b4fcccaef524034417fb50dc1b1641e59f8ea2ddaaf"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_diropen.cpp",
+      "gitMode": "100644",
+      "bytes": 1182,
+      "sha256": "39a13cbf0ddb96ea813fdceb560dcb54678493b343d4d010ed45938bbee0e5b1"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_dirreset.cpp",
+      "gitMode": "100644",
+      "bytes": 771,
+      "sha256": "d1eea9fd8c5f18de6fca0d2103986d54312c50ef9ed5623d7b0634de088d607b"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_fchmod.cpp",
+      "gitMode": "100644",
+      "bytes": 260,
+      "sha256": "25066afeef8cebe4343ec5e5cf51ffc391e7222b61523ecb78cbfb371804db3e"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_fstat.cpp",
+      "gitMode": "100644",
+      "bytes": 867,
+      "sha256": "dbd577becc73777c96886b91d5a8227bbb869e514baffd652eb20933369d72a7"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_fsync.cpp",
+      "gitMode": "100644",
+      "bytes": 734,
+      "sha256": "f226fe8283138440ed4b0bef2f0ab3a5a85c16b8737a6790c8d6b67e02fcbd9c"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_link.cpp",
+      "gitMode": "100644",
+      "bytes": 176,
+      "sha256": "c9879723d0d823b70b478330187dccd18372b99c3b549ea84a06db580db0250e"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_mkdir.cpp",
+      "gitMode": "100644",
+      "bytes": 939,
+      "sha256": "f1192145920332f1e531c8ebb1ae7cf4b56067005afabcff6476b4a99bf047ce"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_open.cpp",
+      "gitMode": "100644",
+      "bytes": 6397,
+      "sha256": "1776905480c7ec16bb240b9a7ce8bac20544ebd861d99bac2480318c57d90af0"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_read.cpp",
+      "gitMode": "100644",
+      "bytes": 2293,
+      "sha256": "bf748c748e9c37ad3b1f6d5347e57ccaa7a9df5cfff492172a0186826be6af34"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_rename.cpp",
+      "gitMode": "100644",
+      "bytes": 1139,
+      "sha256": "06e8dcc082697520e7d3df49d699e74d8d352b4b31bb51a8d03f3cef5cacf72b"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_rmdir.cpp",
+      "gitMode": "100644",
+      "bytes": 839,
+      "sha256": "bd08b6c2197d2156fce47ba4e3ce51b9c7bf3c5bdc01e1d11c6cc5b82da19584"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_seek.cpp",
+      "gitMode": "100644",
+      "bytes": 2380,
+      "sha256": "f317e125a104ff36a6a254e763400c191688dbf6facd9cfe1748cfd4e708eade"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_stat.cpp",
+      "gitMode": "100644",
+      "bytes": 913,
+      "sha256": "16d03f5ac90a9139c9484726d7a5709f1cc6dd9828f70f06c502e7b038014fba"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_statvfs.cpp",
+      "gitMode": "100644",
+      "bytes": 1694,
+      "sha256": "184bf4774f76b3a1cf608ed9d6974bb8f00d39588bab54d23cc3b4657ebfe07c"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_truncate.cpp",
+      "gitMode": "100644",
+      "bytes": 1189,
+      "sha256": "c67fae5152995002be0607a452472ca48472897a799dca587d1321359f27ffda"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_unlink.cpp",
+      "gitMode": "100644",
+      "bytes": 807,
+      "sha256": "679dd9391dc835b5d63a0d4142dbb743a36c12ded8e0e72a98d2c6182b5db74d"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_utils.cpp",
+      "gitMode": "100644",
+      "bytes": 6223,
+      "sha256": "abf73c7773076bdaf1f9fcc895f035543c11f2272c40b52ddbf647bc849336c1"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_utimes.cpp",
+      "gitMode": "100644",
+      "bytes": 192,
+      "sha256": "f1afbe449c298e4c218c9714b426d181e0dce81859bfb4cf538ac31d38c07b39"
+    },
+    {
+      "path": "source/libmocha/source/devoptab/devoptab_fsa_write.cpp",
+      "gitMode": "100644",
+      "bytes": 2558,
+      "sha256": "f8d4b6085592034aeb78b86605595040e7a9c10df143a01255bab1802aff57c4"
+    },
+    {
+      "path": "source/libmocha/source/disc_interface.c",
+      "gitMode": "100644",
+      "bytes": 6300,
+      "sha256": "140a56f8bc40c0f66b2edb527b977bbe828952df5f8d31281b46c35b8c32cb39"
+    },
+    {
+      "path": "source/libmocha/source/fsa.cpp",
+      "gitMode": "100644",
+      "bytes": 6152,
+      "sha256": "67df603746790415511b8bf0f3a563e5c47cee3dc626623b71a783a205d4aa1f"
+    },
+    {
+      "path": "source/libmocha/source/logger.h",
+      "gitMode": "100644",
+      "bytes": 1266,
+      "sha256": "4bd2612429c81eaa61de88ef77443c9700172ced95aef3675c52b58f5203825f"
+    },
+    {
+      "path": "source/libmocha/source/utils.cpp",
+      "gitMode": "100644",
+      "bytes": 15668,
+      "sha256": "3258dde387d0c878839db153fef47d6de3ea1a1dd79cb2e80d46504f1235f307"
+    },
+    {
+      "path": "source/libmocha/source/utils.h",
+      "gitMode": "100644",
+      "bytes": 681,
+      "sha256": "5a46fe14acfe7fed20431bbe8599fafccd0bc9ef19c45336b6e7927dde5cd2e5"
+    },
+    {
+      "path": "source/main.c",
+      "gitMode": "100644",
+      "bytes": 240972,
+      "sha256": "104db9d24e68af6df552a4125688f1319e834968f752563e38a3d7d02e7e27bb"
+    }
+  ],
+  "standaloneAdaptation": "Keep standalone release/build/workflow/package files; componentREADME synchronized asREFERENCE.md; standaloneREADME/PUBLICATION adapted and standalone.gitignore preserved. Native inputs remain byte-exact.",
+  "finalization": "Refresh mapping from reviewed final primary; normal versioned build/provenance, notices, exact public source/package and native activation acceptance before release. No build or publication established by this file."
+}

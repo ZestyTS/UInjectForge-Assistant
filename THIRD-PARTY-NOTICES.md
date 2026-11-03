@@ -13,6 +13,15 @@ The retained Docker toolchain includes:
 - mbed TLS 2.28.1-1: Apache-2.0, see licenses/mbedTLS.txt.
 - devkitPro wut: zlib license, see licenses/wut.txt.
 
+Assistant additionally builds wiiu-env/libmocha source at commit
+75f31e0a3e2415a3619f732eab95e65f73d8d99b, with the one-line upstream handle
+cleanup fix described in source/libmocha/UPSTREAM.md. It is LGPL-3.0 licensed; see
+licenses/libmocha-LGPL-3.0.txt and source/libmocha/LICENSE. Corresponding library
+source and its original Makefile are retained in source/libmocha. The Assistant
+source and Makefile permit rebuilding/relinking it with a modified library using
+the pinned public SDK. A binary distribution must accompany these source/relink
+materials; do not publish an older binary-only package for this dependency change.
+
 Notice texts were collected from wiiuenv/devkitppc:20220907 and wut commit
 0edd2e9c5c24d128714a6ef892c4b77bb5e20fce. This records the existing build
 environment; it is not a claim that its library versions are current.

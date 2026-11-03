@@ -1,5 +1,6 @@
 #include "assistant_telemetry.h"
 #include "assistant_storage.h"
+#include "assistant_paths.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -76,10 +77,10 @@ static bool mkdir_recursive(const char *path)
 
     char current[ASSISTANT_TELEMETRY_PATH];
     copy_text(current, sizeof(current), path);
-    char *cursor = strstr(current, ":/");
-    cursor = cursor ? cursor + 2 : current;
-    if (*cursor == '/')
-        cursor++;
+    size_t offset = assistant_directory_creation_offset(current);
+    if (offset >= strlen(current))
+        return path_is_directory(current);
+    char *cursor = current + offset;
 
     for (; *cursor; cursor++)
     {

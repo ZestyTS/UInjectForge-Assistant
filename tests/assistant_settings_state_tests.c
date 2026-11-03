@@ -1,0 +1,81 @@
+#include "assistant_test_temp.h"
+#include <assert.h>
+
+int main(void)
+{
+    char root[ASSISTANT_TEST_TEMP_ROOT_CAPACITY];
+    assert(assistant_test_make_temp_directory(root, sizeof(root), "uif-settings-state"));
+    AssistantState *s = calloc(1, sizeof(*s));
+    assert(s);
+    copy_text(s->sd_root, sizeof(s->sd_root), root);
+    load_assistant_config(s);
+    assert(s->http_port == 8573 && !s->auto_install_enabled && s->manual_install_enabled);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/uinjectforge", root); assert(mkdir(path, 0700) == 0);
+    snprintf(path, sizeof(path), "%s/uinjectforge/assistant", root); assert(mkdir(path, 0700) == 0);
+    snprintf(path, sizeof(path), "%s/uinjectforge/assistant/preferences.json", root);
+    FILE *f = fopen(path, "wb"); assert(f);
+    assert(fputs("{\"autoInstallEnabled\":true}", f) >= 0 && fclose(f) == 0);
+    load_assistant_preferences(s);
+    assert(s->auto_install_enabled);
+    assert(load_persistent_pairing_code(s) && s->pairing_code == 123456 && s->pairing_code_persisted);
+    load_assistant_config(s);
+    load_assistant_preferences(s);
+    assert(s->auto_install_enabled && load_persistent_pairing_code(s) && s->pairing_code == 123456);
+    AssistantSettings desired = s->settings;
+    desired.auto_install_enabled = false;
+    desired.http_port = 8888;
+    desired.broadcast_port = 8889;
+    desired.broadcast_enabled = false;
+    desired.simple_ui = false;
+    desired.allow_ui_scale = true;
+    desired.ui_scale_percent = 80;
+    s->transfer.active = true;
+    assert(!save_ui_settings(s, &desired) && !s->settings_save_ok && s->settings_revision == 1);
+    assert(s->auto_install_enabled && s->settings.http_port == 8573);
+    s->transfer.active = false;
+    s->auto_install_pending = true;
+    assert(!save_ui_settings(s, &desired));
+    s->auto_install_pending = false;
+    s->install_active = true;
+    assert(!save_ui_settings(s, &desired));
+    s->install_active = false;
+    assert(save_ui_settings(s, &desired) && s->settings_save_ok && s->settings_revision == 4);
+    assert(s->settings_restart_required && s->settings.managed);
+    assert(s->http_port == 8573 && s->broadcast_port == 8573 && s->broadcast_enabled);
+    assert(!s->auto_install_enabled && !s->simple_ui && s->ui_scale > .799 && s->ui_scale < .801);
+    load_assistant_config(s);
+    load_assistant_preferences(s);
+    assert(!s->auto_install_enabled); // managed config wins over the stale legacy preference
+    assert(s->http_port == 8888 && s->broadcast_port == 8889 && !s->broadcast_enabled);
+    assert(load_persistent_pairing_code(s) && s->pairing_code == 123456);
+    desired.install_enabled = false;
+    desired.auto_install_enabled = desired.manual_install_enabled = true;
+    assert(save_ui_settings(s, &desired));
+    assert(!s->settings_restart_required && !s->manual_install_enabled && !s->auto_install_enabled);
+    desired.install_enabled = true;
+    assert(save_ui_settings(s, &desired) && s->manual_install_enabled && s->auto_install_enabled);
+    desired.http_port = 0;
+    assert(!save_ui_settings(s, &desired));
+    assert(s->settings.http_port == 8888 && s->auto_install_enabled);
+    snprintf(path, sizeof(path), "%s/wiiu/apps/uinjectforge-assistant/config.json", root);
+    f = fopen(path, "wb"); assert(f);
+    assert(fputs("{broken}", f) >= 0 && fclose(f) == 0);
+    load_assistant_config(s);
+    load_assistant_preferences(s);
+    assert(!s->install_enabled && !s->auto_install_enabled && !s->manual_install_enabled);
+    assert(s->settings_message[0]);
+    assert(!load_persistent_pairing_code(s) && !s->pairing_code_persisted);
+    assert(unlink(path) == 0);
+    snprintf(path, sizeof(path), "%s/wiiu/apps/uinjectforge-assistant/config.json.bak", root); assert(unlink(path) == 0);
+    snprintf(path, sizeof(path), "%s/wiiu/apps/uinjectforge-assistant", root); assert(rmdir(path) == 0);
+    snprintf(path, sizeof(path), "%s/wiiu/apps", root); assert(rmdir(path) == 0);
+    snprintf(path, sizeof(path), "%s/wiiu", root); assert(rmdir(path) == 0);
+    snprintf(path, sizeof(path), "%s/uinjectforge/assistant/preferences.json", root); assert(unlink(path) == 0);
+    snprintf(path, sizeof(path), "%s/uinjectforge/assistant", root); assert(rmdir(path) == 0);
+    snprintf(path, sizeof(path), "%s/uinjectforge", root); assert(rmdir(path) == 0);
+    assert(rmdir(root) == 0);
+    free(s);
+    puts("Production settings handlers: live apply, restart boundaries, busy guards and legacy migration passed.");
+    return 0;
+}

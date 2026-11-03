@@ -13,7 +13,7 @@ types {
     }
     next
 }
-/^static / && /[ *](store_transfer_result|find_transfer_result|copy_text|json_escape|append_format|authorization_ok|handle_transfer_status|build_transfer_result_json|starts_with_ignore_case|skip_spaces)\(/ {
+/^static / && !/;$/ && /[ *](store_transfer_result|find_transfer_result|copy_text|join_path|json_escape|append_format|authorization_token|authorization_ok|handle_remembered_pairing|handle_transfer_status|build_transfer_result_json|starts_with_ignore_case|skip_spaces)\(/ {
     function_body = 1
     functions++
 }
@@ -22,7 +22,7 @@ function_body {
     if (/^}$/) function_body = 0
 }
 END {
-    if (!types_done || functions != 10 || function_body) {
+    if (!types_done || functions != 13 || function_body) {
         print "Receiver extraction failed; review changed production definitions." > "/dev/stderr"
         exit 1
     }

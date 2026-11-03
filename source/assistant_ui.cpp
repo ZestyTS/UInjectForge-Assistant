@@ -50,15 +50,30 @@ int selectedInstallTarget = 1;
 bool installConfirmOpen = false;
 bool launchConfirmOpen = false;
 bool autoInstallConfirmOpen = false;
+bool forgetDevicesConfirmOpen = false;
+bool pairingChangesAllowed = false;
 bool contentFocused = false;
 bool installActive = false;
 bool simpleUi = false;
 bool dashboardOpen = false;
+bool receiverOpen = false;
 bool startupActive = false;
 bool touchHeld = false;
 bool cachedInstallEnabled = false;
 bool cachedInstallGloballyEnabled = false;
 bool cachedAutoInstallEnabled = false;
+AssistantSettings settingsSaved{};
+AssistantSettings settingsDraft{};
+bool settingsReady = false;
+bool settingsBusy = false;
+bool settingsPending = false;
+bool settingsSaveConfirm = false;
+unsigned int settingsRevision = 0;
+int settingsTab = 0;
+int settingsFocus = 0;
+int portEditing = -1;
+int keypadFocus = 0;
+std::string portText;
 bool packagesLoaded = false;
 bool setupLoaded = false;
 bool titleCatalogAvailable = false;
@@ -131,31 +146,24 @@ SDL_Color Warn{246, 194, 83, 255};
 SDL_Color Danger{255, 107, 129, 255};
 
 const char *PageNames[] = {
-    "Overview",
     "Receiver",
-    "Pairing",
-    "Transfer",
-    "Results",
-    "Activity",
     "Packages",
-    "Log",
-    "Title Storage",
-    "Network",
-    "Health",
-    "Setup Check",
+    "Installed Games",
+    "Settings",
     "Diagnostics",
-    "Controls",
-    "Config",
 };
 
 constexpr int PageCount = sizeof(PageNames) / sizeof(PageNames[0]);
-constexpr int PackagesPageIndex = 6;
-constexpr int InstalledTitlesPageIndex = 8;
-constexpr int ConfigPageIndex = 14;
-constexpr int SidebarVisibleCount = 8;
-int sidebarStart = 0;
+constexpr int PackagesPageIndex = 1;
+constexpr int InstalledTitlesPageIndex = 2;
+constexpr int ConfigPageIndex = 3;
+constexpr int DiagnosticsPageIndex = 4;
+constexpr int DiagnosticTabCount = 4;
+int diagnosticTab = 0;
+bool diagnosticFocused = false;
+constexpr int SidebarVisibleCount = PageCount;
 
-enum class TouchCommand { Page, SidebarUp, SidebarDown, Enter, Back, Refresh, Package, Title, Previous, Next, Confirm, Nand, Usb, AutoInstall, Dashboard, Receiver };
+enum class TouchCommand { Page, Enter, Back, Refresh, Package, Title, Previous, Next, Confirm, Nand, Usb, AutoInstall, Dashboard, Receiver, ForgetDevices, Settings, DiagnosticTab, SettingsTab, Setting, SettingDecrease, SettingIncrease, SettingsDefaults, SettingsCancel, SettingsSave, PortKey };
 struct TouchTarget { SDL_Rect rect; TouchCommand command; int value; };
 std::vector<TouchTarget> touchTargets;
 TouchTarget pressedTouch{};
@@ -388,13 +396,6 @@ void draw_status_row(const char *label, const char *value, bool ok, int x, int y
     draw_text(value, x + 420, y + 8, 28, ok ? White : Warn, w - 448);
 }
 
-void draw_activity_lines(const AssistantUiModel *model, int x, int y, int lineHeight, unsigned int maxLines, int maxWidth)
-{
-    unsigned int visible = std::min(model->activity_count, maxLines);
-    unsigned int start = model->activity_count > visible ? model->activity_count - visible : 0;
-    for (unsigned int i = 0; i < visible; i++)
-        draw_text(model->activity_log[start + i], x, y + static_cast<int>(i) * lineHeight, 25, i + 1 == visible ? White : Muted, maxWidth);
-}
 
 void draw_topbar_connection(const AssistantUiModel *model)
 {
@@ -402,7 +403,8 @@ void draw_topbar_connection(const AssistantUiModel *model)
     std::snprintf(endpoint, sizeof(endpoint), "%s:%d", model->ip_address[0] ? model->ip_address : "waiting", model->http_port);
 
     char pairing[96];
-    std::snprintf(pairing, sizeof(pairing), "Code %06u", model->pairing_code);
+    if (model->pairing_code_persisted) std::snprintf(pairing, sizeof(pairing), "Code %06u", model->pairing_code);
+    else std::snprintf(pairing, sizeof(pairing), "Pairing unavailable");
 
     draw_text(endpoint, 980, 24, 30, White, 420);
     draw_text(model->paired ? "Paired" : pairing, 980, 66, 32, model->paired ? Ready : AccentLight, 420);
@@ -411,25 +413,17 @@ void draw_topbar_connection(const AssistantUiModel *model)
 void draw_page_sidebar()
 {
     draw_panel(54, 150, 330, 826, contentFocused ? Border : Accent);
-    draw_text("Pages", 84, 178, 40, White, 250);
+    draw_text("Assistant", 84, 178, 40, White, 250);
 
-    if (selectedPage < sidebarStart)
-        sidebarStart = selectedPage;
-    if (selectedPage >= sidebarStart + SidebarVisibleCount)
-        sidebarStart = selectedPage - SidebarVisibleCount + 1;
     for (int row = 0; row < SidebarVisibleCount; row++)
     {
-        int i = sidebarStart + row;
-        if (i >= PageCount)
-            break;
+        int i = row;
         int y = 224 + row * 82;
         bool selected = i == selectedPage;
         draw_rect(82, y, 274, 72, selected ? AccentDark : FieldBackground);
         draw_text(PageNames[i], 104, y + 23, 26, White, 230);
         add_touch_target(82, y, 274, 72, TouchCommand::Page, i);
     }
-    draw_button("Up", 82, 898, 126, TouchCommand::SidebarUp, 0, false, sidebarStart > 0);
-    draw_button("Down", 220, 898, 136, TouchCommand::SidebarDown, 0, false, sidebarStart + SidebarVisibleCount < PageCount);
 }
 
 const char *safe(const char *value)
@@ -760,6 +754,46 @@ void draw_progress(int x, int y, int w, int h, long long current, long long tota
     fill = std::min(fill, w);
     if (fill > 0)
         draw_rect(x, y, fill, h, Accent);
+}
+
+int progress_percent(long long current, long long total)
+{
+    return total > 0 ? static_cast<int>(std::clamp(current * 100.0 / total, 0.0, 100.0)) : 0;
+}
+
+void draw_file_progress(const AssistantUiModel *model, int x, int y, int width)
+{
+    if (!model->current_file_active) {
+        draw_text(model->transfer_active ? "Waiting for next file" : "No file in progress", x, y, 28, Muted, width);
+        draw_text(safe(model->status), x, y + 40, 26, White, width);
+        return;
+    }
+    char heading[320], bytes[32], total[32], metrics[256];
+    std::snprintf(heading, sizeof(heading), "%s: %s", model->verifying_files ? "Verifying SD" : "Receiving", model->current_file_path);
+    size_text(model->current_file_bytes, bytes, sizeof(bytes));
+    size_text(model->current_file_total_bytes, total, sizeof(total));
+    int percent = model->current_file_total_bytes == 0 ? 100 : progress_percent(model->current_file_bytes, model->current_file_total_bytes);
+    std::snprintf(metrics, sizeof(metrics), "%d%% | %s / %s | Avg %.2f MiB/s | Last %s %us ago",
+        percent, bytes, total, model->current_file_bytes_per_second / (1024.0 * 1024.0),
+        model->verifying_files ? "read" : "data", model->current_file_idle_seconds);
+    draw_text(heading, x, y, 28, White, width);
+    draw_text(metrics, x, y + 36, 26, model->current_file_idle_seconds >= 5 ? Warn : Muted, width);
+    draw_progress(x, y + 80, width, 20, model->current_file_total_bytes == 0 ? 1 : model->current_file_bytes,
+        model->current_file_total_bytes == 0 ? 1 : model->current_file_total_bytes);
+}
+
+void draw_batch_percentage(const AssistantUiModel *model, int x, int y, int width)
+{
+    char label[48];
+    auto done = model->verifying_files ? model->verified_bytes : model->uploaded_bytes;
+    std::snprintf(label, sizeof(label), "%d%%", progress_percent(done, model->total_bytes));
+    draw_text(label, x, y, 28, White, width);
+}
+
+void format_pairing_code(const AssistantUiModel *model, char *text, size_t size)
+{
+    if (model->pairing_code_persisted) std::snprintf(text, size, "%06u", model->pairing_code);
+    else std::snprintf(text, size, "Unavailable");
 }
 
 void join_path(char *destination, size_t destinationSize, const char *root, const char *relative)
@@ -1271,7 +1305,7 @@ void draw_setup_check_page(const AssistantUiModel *model)
             {assistantReady ? "installed on SD" : "missing app files", assistantReady},
             {bridgeReady ? "plugin found" : "optional plugin missing", true},
             {ftpReady ? "plugin found" : "optional FTP plugin missing", true},
-            {nintendontReady ? "boot.dol found" : "needed for GCN tests", nintendontReady},
+            {nintendontReady ? "boot.dol found" : "not installed (optional)", true},
             {noodsReady ? "runtime found" : "optional runtime missing", true},
             {ppssppStatus, !ppssppRuntimeReady || ppssppAssetsReady},
             {controllerReady ? "custom config found" : "optional config missing", true},
@@ -1285,59 +1319,14 @@ void draw_setup_check_page(const AssistantUiModel *model)
         draw_status_row(labels[i], cachedSetupRows[i].first.c_str(), cachedSetupRows[i].second, 444, 286 + int(i) * 52, 1280);
 }
 
-void draw_overview_page(const AssistantUiModel *model)
-{
-    draw_panel(414, 150, 1452, 232, AccentDark);
-    draw_text("Overview", 444, 178, 42, White, 440);
-    char endpoint[160];
-    std::snprintf(
-        endpoint,
-        sizeof(endpoint),
-        "%s:%d",
-        model->ip_address[0] ? model->ip_address : "waiting",
-        model->http_port);
-    char pair[32];
-    std::snprintf(pair, sizeof(pair), "%06u", model->pairing_code);
-    draw_label_value("Receiver", safe(model->connection_state), 448, 248, 240);
-    draw_label_value("Address", endpoint, 728, 248, 430);
-    draw_label_value(model->paired ? "Pairing" : "Code", model->paired ? "Paired" : pair, 1196, 248, 230);
-    draw_label_value("SD Root", safe(model->sd_root), 1454, 248, 360);
-
-    draw_panel(414, 418, 706, 286, model->transfer_active ? Accent : Border);
-    draw_text("Transfer", 444, 446, 36, White, 320);
-    draw_text(model->transfer_active ? safe(model->package_display_name) : "No active transfer", 444, 500, 30, White, 610);
-    char fileProgress[64];
-    std::snprintf(fileProgress, sizeof(fileProgress), "%d / %d files", model->uploaded_files, model->file_count);
-    char uploaded[32];
-    char total[32];
-    size_text(model->uploaded_bytes, uploaded, sizeof(uploaded));
-    size_text(model->total_bytes, total, sizeof(total));
-    draw_metric("Files", fileProgress, 444, 566, 240);
-    draw_metric("Bytes", uploaded, 714, 566, 210);
-    draw_progress(948, 600, 126, 28, model->uploaded_bytes, model->total_bytes);
-
-    draw_panel(1160, 418, 706, 286, Border);
-    draw_text("Diagnostics", 1190, 446, 36, White, 360);
-    char http[96];
-    std::snprintf(http, sizeof(http), "%u requests, %u errors", model->http_request_count, model->http_error_count);
-    char udp[128];
-    std::snprintf(udp, sizeof(udp), "%u probes, %u replies", model->discovery_probe_count, model->discovery_reply_count);
-    draw_metric("HTTP", http, 1190, 510, 300);
-    draw_metric("UDP", udp, 1520, 510, 280);
-    draw_text(model->last_http_error[0] ? model->last_http_error : "No HTTP errors.", 1190, 636, 26, model->last_http_error[0] ? Danger : Muted, 620);
-
-    draw_panel(414, 740, 1452, 236, Border);
-    draw_text("Activity", 444, 764, 34, White, 260);
-    draw_activity_lines(model, 444, 818, 30, 5, 1340);
-}
 
 void draw_pairing_page(const AssistantUiModel *model)
 {
     draw_panel(414, 150, 1452, 636, AccentDark);
     draw_text("Pairing", 444, 178, 42, White, 420);
-    draw_text(model->paired ? "Ready for transfers from UIF." : "Enter this code in UIF.", 444, 238, 30, Muted, 720);
+    draw_text(model->paired ? "Connected" : "Not connected", 444, 238, 30, Muted, 720);
     char pair[32];
-    std::snprintf(pair, sizeof(pair), "%06u", model->pairing_code);
+    format_pairing_code(model, pair, sizeof(pair));
     draw_text(pair, 444, 306, 104, AccentLight, 500);
     draw_metric("State", model->paired ? "Paired" : "Not paired", 940, 276, 310);
     char attempts[96];
@@ -1346,7 +1335,10 @@ void draw_pairing_page(const AssistantUiModel *model)
     std::snprintf(failures, sizeof(failures), "%u failures", model->pairing_failure_count);
     draw_metric("Attempts", attempts, 1282, 276, 250);
     draw_metric("Failures", failures, 1564, 276, 240);
-    draw_text("If pairing fails, run Check Status.", 444, 468, 28, White, 720);
+    char trusted[80];
+    std::snprintf(trusted, sizeof(trusted), "Remembered devices: %u / 8", model->trusted_device_count);
+    draw_text(trusted, 444, 468, 28, White, 720);
+    draw_button("Forget paired devices", 444, 700, 650, TouchCommand::ForgetDevices, 0, false, pairingChangesAllowed);
     draw_text("Last HTTP error", 444, 560, 30, Muted, 360);
     draw_text(model->last_http_error[0] ? model->last_http_error : "None", 444, 604, 28, model->last_http_error[0] ? Danger : White, 840);
 
@@ -1358,20 +1350,13 @@ void draw_pairing_page(const AssistantUiModel *model)
         model->ip_address[0] ? model->ip_address : "0.0.0.0",
         model->http_port,
         model->pairing_code);
-    draw_qr_code(pairingUrl, 1460, 452, 4);
-    draw_text("Status QR", 1450, 632, 22, Muted, 260);
-    draw_text(pairingUrl, 1260, 676, 20, White, 560);
+    if (model->pairing_code_persisted) {
+        draw_qr_code(pairingUrl, 1460, 452, 4);
+        draw_text("Status QR", 1450, 632, 22, Muted, 260);
+        draw_text(pairingUrl, 1260, 676, 20, White, 560);
+    }
 }
 
-void draw_activity_page(const AssistantUiModel *model)
-{
-    draw_panel(414, 150, 1452, 636, Border);
-    draw_text("Activity Log", 444, 178, 42, White, 520);
-    draw_text("Newest events; also saved to SD.", 444, 238, 30, Muted, 760);
-    draw_text(safe(model->log_path), 444, 292, 28, White, 1200);
-    draw_rect(444, 358, 1350, 2, Accent);
-    draw_activity_lines(model, 444, 394, 44, ASSISTANT_UI_ACTIVITY_LINES, 1320);
-}
 
 void draw_log_page(const AssistantUiModel *model)
 {
@@ -1392,150 +1377,45 @@ void draw_log_page(const AssistantUiModel *model)
         draw_text(model->log_tail[i], 444, 334 + static_cast<int>(i) * 45, 23, i + 1 == visible ? White : Muted, 1320);
 }
 
-void draw_network_page(const AssistantUiModel *model)
-{
-    draw_panel(414, 150, 1452, 636, Border);
-    draw_text("Network", 444, 178, 42, White, 480);
-    char endpoint[160];
-    std::snprintf(endpoint, sizeof(endpoint), "%s:%d", model->ip_address[0] ? model->ip_address : "waiting", model->http_port);
-    char httpPort[64];
-    char broadcastPort[64];
-    std::snprintf(httpPort, sizeof(httpPort), "%d", model->http_port);
-    std::snprintf(broadcastPort, sizeof(broadcastPort), "%d", model->broadcast_port);
-    draw_metric("Address", endpoint, 444, 262, 500);
-    draw_metric("HTTP", httpPort, 980, 262, 220);
-    draw_metric("UDP", broadcastPort, 1236, 262, 220);
-    draw_metric("UDP socket", model->broadcast_socket_ready ? "ready" : "off", 1492, 262, 260);
-    draw_status_row("Discovery", model->broadcast_enabled ? "UDP replies on" : "off", model->broadcast_enabled, 444, 414, 1280);
-    draw_status_row("Passive broadcast", model->passive_broadcast_enabled ? "enabled" : "off", !model->passive_broadcast_enabled, 444, 478, 1280);
-    char counters[160];
-    std::snprintf(counters, sizeof(counters), "%u probes, %u replies, %u broadcasts", model->discovery_probe_count, model->discovery_reply_count, model->discovery_broadcast_count);
-    draw_status_row("Counters", counters, true, 444, 542, 1280);
-    draw_status_row("Last peer", safe(model->last_discovery_peer), model->last_discovery_peer[0] != '\0', 444, 606, 1280);
-}
-
-void draw_health_page(const AssistantUiModel *model)
-{
-    draw_panel(414, 150, 1452, 636, Border);
-    draw_text("Health", 444, 178, 42, White, 420);
-    draw_status_row("SD", safe(model->sd_root), model->sd_root[0] != '\0', 444, 262, 1280);
-    char space[128];
-    char freeBytes[32];
-    char totalBytes[32];
-    size_text(model->sd_free_bytes, freeBytes, sizeof(freeBytes));
-    size_text(model->sd_total_bytes, totalBytes, sizeof(totalBytes));
-    std::snprintf(space, sizeof(space), model->sd_space_known ? "%s free of %s" : "unknown", freeBytes, totalBytes);
-    draw_status_row("Free space", space, model->sd_space_known, 444, 326, 1280);
-    draw_status_row("HTTP", model->http_port > 0 ? "ready" : "not ready", model->http_port > 0, 444, 390, 1280);
-    draw_status_row("Pairing", model->paired ? "paired" : "waiting", model->paired, 444, 454, 1280);
-    draw_status_row("Transfer", model->transfer_active ? safe(model->package_display_name) : "idle", true, 444, 518, 1280);
-    char fit[128];
-    char required[32];
-    size_text(model->transfer_required_bytes, required, sizeof(required));
-    std::snprintf(fit, sizeof(fit), model->transfer_active ? "%s required" : "no active transfer", required);
-    draw_status_row("Capacity", fit, model->transfer_fits_sd, 444, 582, 1280);
-    char heartbeat[96];
-    std::snprintf(heartbeat, sizeof(heartbeat), "%u loop heartbeat(s)", model->loop_heartbeat_count);
-    draw_status_row("Loop", heartbeat, true, 444, 646, 1280);
-    draw_text("Read-only diagnostics.", 444, 740, 28, Muted, 600);
-}
-
-void draw_controls_page(const AssistantUiModel *model)
-{
-    draw_panel(414, 150, 1452, 636, Border);
-    draw_text("Controls", 444, 178, 42, White, 480);
-    draw_status_row("HOME", "open HOME Menu", true, 444, 262, 1280);
-    draw_status_row("D-pad", "Choose page or list item", true, 444, 326, 1280);
-    draw_status_row("A / B", "Open or confirm / Back", true, 444, 390, 1280);
-    draw_status_row("Touch", "Tap a page, item, or action", true, 444, 454, 1280);
-    draw_text("Detected controllers", 444, 508, 32, Muted, 460);
-    draw_text(safe(model->controller_summary), 444, 558, 30, White, 1260);
-    draw_text("Check Status includes this.", 444, 660, 28, Muted, 700);
-}
 
 void draw_receiver_page(const AssistantUiModel *model)
 {
-    draw_panel(414, 150, 1452, 356, AccentDark);
-    draw_text("Connect", 444, 178, 42, White, 500);
+    draw_panel(414, 150, 1452, 320, AccentDark);
+    draw_text("Receiver", 444, 178, 42, White, 500);
     char endpoint[160];
     std::snprintf(endpoint, sizeof(endpoint), "%s:%d", model->ip_address[0] ? model->ip_address : "waiting", model->http_port);
-    draw_label_value("Address", endpoint, 448, 250, 500);
-    draw_text("Pairing code", 448, 358, 30, Muted, 420);
     char pair[32];
-    std::snprintf(pair, sizeof(pair), "%06u", model->pairing_code);
-    draw_text(pair, 448, 392, 76, AccentLight, 420);
+    format_pairing_code(model, pair, sizeof(pair));
+    draw_label_value("Address", endpoint, 444, 250, 650);
+    draw_label_value("Pairing code", pair, 1180, 250, 570);
+    draw_text(safe(model->status), 444, 374, 30, White, 1330);
 
-    draw_label_value("SD root", safe(model->sd_root), 1040, 250, 540);
-    draw_label_value("Discovery", model->broadcast_enabled ? "UDP replies on" : "off", 1040, 358, 280);
-    draw_label_value("Passive UDP", model->passive_broadcast_enabled ? "on" : "off", 1364, 358, 280);
+    draw_panel(414, 506, 1452, 280, model->transfer_active ? Accent : Border);
+    draw_text(model->verifying_files ? "Verifying SD" : model->transfer_active ? "Receiving" : "Last transfer",
+        444, 534, 36, White, 600);
+    if (model->transfer_active) {
+        draw_text(safe(model->package_display_name), 444, 594, 32, White, 1300);
+        char files[80];
+        std::snprintf(files, sizeof(files), "%d / %d files", model->uploaded_files, model->file_count);
+        draw_text(files, 444, 660, 28, Muted, 320);
+        draw_progress(830, 666, 770, 30, model->verifying_files ? model->verified_bytes : model->uploaded_bytes, model->total_bytes);
+        draw_batch_percentage(model, 1650, 660, 150);
+    } else if (model->last_transfer_has_result) {
+        draw_text(safe(model->last_transfer_package_display_name), 444, 594, 32, White, 1300);
+        draw_text(safe(model->last_transfer_message), 444, 660, 28,
+            model->last_transfer_success ? Ready : model->last_transfer_canceled ? Warn : Danger, 1330);
+    } else draw_text("No transfers yet", 444, 602, 30, Muted, 1330);
 
-    draw_panel(414, 542, 1452, 244, Border);
-    draw_text("Status", 444, 570, 40, White, 360);
-    draw_text(safe(model->status), 444, 626, 34, White, 1330);
-    draw_text("Open the UIF Assistant panel.", 444, 704, 28, Muted, 700);
-    draw_text("HOME opens the Wii U Menu.", 1260, 704, 28, Muted, 500);
-}
-
-void draw_transfer_page(const AssistantUiModel *model)
-{
-    draw_panel(414, 150, 1452, 416, model->transfer_active ? Accent : Border);
-    draw_text("Transfer", 444, 178, 42, White, 500);
-    draw_text(model->transfer_active ? safe(model->package_display_name) : "No active transfer", 444, 242, 38, White, 960);
-    draw_label_value("Kind", safe(model->package_kind), 444, 330, 320);
-    draw_label_value("Transfer ID", safe(model->transfer_id), 444, 432, 360);
-    draw_label_value("Target", safe(model->target_root), 840, 432, 520);
-    draw_label_value("After", safe(model->post_transfer_action), 1400, 432, 340);
-
-    char fileProgress[64];
-    std::snprintf(fileProgress, sizeof(fileProgress), "%d / %d files", model->uploaded_files, model->file_count);
-    char uploaded[32];
-    char total[32];
-    size_text(model->uploaded_bytes, uploaded, sizeof(uploaded));
-    size_text(model->total_bytes, total, sizeof(total));
-    char byteProgress[96];
-    std::snprintf(byteProgress, sizeof(byteProgress), "%s / %s", uploaded, total);
-    draw_metric("Files", fileProgress, 840, 324, 260);
-    draw_metric("Bytes", byteProgress, 1130, 324, 340);
-    draw_progress(1500, 354, 260, 30, model->uploaded_bytes, model->total_bytes);
-
-    draw_panel(414, 602, 1452, 244, Border);
-    draw_text("Receiver Activity", 444, 630, 40, White, 420);
-    draw_activity_lines(model, 444, 686, 30, 5, 1320);
-}
-
-void draw_results_page(const AssistantUiModel *model)
-{
-    draw_panel(414, 150, 1452, 636, model->last_transfer_success ? Ready : Border);
-    draw_text("Last Transfer", 444, 178, 42, White, 620);
-    if (!model->last_transfer_has_result)
-    {
-        draw_text("No completed transfer yet.", 444, 252, 34, Muted, 900);
-        draw_text("Run a transfer from UIF, then return here.", 444, 312, 28, Muted, 900);
-        return;
+    if (model->current_file_active) {
+        draw_panel(414, 820, 1452, 156, Border);
+        draw_file_progress(model, 444, 836, 1360);
+    } else if (model->activity_count > 0 && std::strcmp(model->activity_log[model->activity_count - 1], model->status) != 0) {
+        draw_panel(414, 820, 1452, 156, Border);
+        const char *latest = model->activity_log[model->activity_count - 1];
+        draw_text(latest, 444, 854, 28, Muted, 1320);
     }
-
-    SDL_Color statusColor = model->last_transfer_success ? Ready : model->last_transfer_canceled ? Warn : Danger;
-    draw_text(safe(model->last_transfer_status), 444, 250, 46, statusColor, 420);
-    draw_text(safe(model->last_transfer_message), 720, 260, 30, White, 1040);
-    draw_label_value("Package", safe(model->last_transfer_package_display_name), 444, 354, 580);
-    draw_label_value("Kind", safe(model->last_transfer_package_kind), 1080, 354, 260);
-    draw_label_value("Action", safe(model->last_transfer_post_transfer_action), 1380, 354, 360);
-    draw_label_value("Target", safe(model->last_transfer_target_root), 444, 468, 650);
-    draw_label_value("Transfer ID", safe(model->last_transfer_id), 1140, 468, 420);
-
-    char files[96];
-    std::snprintf(files, sizeof(files), "%d / %d files", model->last_transfer_uploaded_files, model->last_transfer_file_count);
-    char uploaded[32];
-    char total[32];
-    size_text(model->last_transfer_uploaded_bytes, uploaded, sizeof(uploaded));
-    size_text(model->last_transfer_total_bytes, total, sizeof(total));
-    char bytes[96];
-    std::snprintf(bytes, sizeof(bytes), "%s / %s", uploaded, total);
-    draw_metric("Files", files, 444, 596, 300);
-    draw_metric("Bytes", bytes, 790, 596, 360);
-    if (model->last_transfer_failed_file[0])
-        draw_metric("Failed file", safe(model->last_transfer_failed_file), 1196, 596, 520);
 }
+
 
 int list_start(int selected, int count)
 {
@@ -1605,7 +1485,7 @@ void draw_sd_packages_page(const AssistantUiModel *model)
 void draw_installed_page()
 {
     draw_panel(414, 150, 1452, 826, contentFocused ? Accent : Border);
-    draw_text("Title Locations", 444, 178, 42, White, 860);
+    draw_text("Installed Games", 444, 178, 42, White, 860);
     if (!installedTitlesLoaded)
         refresh_installed_titles();
     draw_list_actions(!cachedInstalledTitles.empty());
@@ -1653,7 +1533,6 @@ void draw_installed_page()
         draw_button("Next", 660, 822, 170, TouchCommand::Next);
         draw_button("Launch...", 1534, 822, 270, TouchCommand::Confirm, 0, true);
     }
-    draw_text("Title-folder access and installation are separate permissions.", 444, 916, 25, Muted, 1320);
 }
 
 void draw_confirmation()
@@ -1684,10 +1563,21 @@ void draw_confirmation()
     draw_button(installConfirmOpen ? "Install" : "Launch", 1340, 738, 310, TouchCommand::Confirm, 0, true, validPolicy);
 }
 
+void draw_forget_devices_confirmation()
+{
+    touchTargets.clear();
+    draw_panel(610, 282, 1120, 580, Accent);
+    draw_text("Forget all paired devices?", 654, 326, 42, White, 1020);
+    draw_text("All saved connections and this session will be revoked.", 654, 430, 29, White, 1010);
+    draw_text("A new PIN will be required on each device.", 654, 504, 29, Muted, 1010);
+    draw_button("Cancel", 1060, 744, 260, TouchCommand::Back);
+    draw_button("Forget all", 1344, 744, 330, TouchCommand::Confirm, 0, true);
+}
+
 void draw_auto_install_confirmation()
 {
     touchTargets.clear();
-    const bool enabling = !cachedAutoInstallEnabled;
+    const bool enabling = settingsSaveConfirm || !cachedAutoInstallEnabled;
     draw_panel(610, 282, 1120, 580, Accent);
     draw_text(enabling ? "Enable automatic installs?" : "Disable automatic installs?", 654, 326, 42, White, 1020);
     draw_text(
@@ -1710,75 +1600,230 @@ void draw_auto_install_confirmation()
         1010);
     draw_text("Copy files only remains UIF's default.", 654, 558, 27, Muted, 990);
     draw_button("Cancel", 1060, 744, 260, TouchCommand::Back);
-    draw_button(enabling ? "Enable" : "Disable", 1344, 744, 330, TouchCommand::Confirm, 0, true);
+    draw_button(settingsSaveConfirm ? "Save and enable" : enabling ? "Enable" : "Disable", 1344, 744, 330, TouchCommand::Confirm, 0, true, !settingsBusy && !settingsPending);
 }
 
 void draw_install_progress(const AssistantUiModel *model)
 {
     touchTargets.clear();
-    draw_panel(500, 304, 1320, 500, Accent);
+    draw_panel(500, 304, 1320, model->current_file_active ? 650 : 500, Accent);
     draw_text("Installing", 544, 346, 46, White, 1180);
-    draw_text(safe(model->status), 544, 446, 30, White, 1230);
+    if (model->current_file_active) {
+        char done[32], total[32], progress[128];
+        size_text(model->install_done_bytes, done, sizeof(done));
+        size_text(model->install_total_bytes, total, sizeof(total));
+        std::snprintf(progress, sizeof(progress), "%d%% | %s / %s", progress_percent(model->install_done_bytes, model->install_total_bytes), done, total);
+        draw_text(progress, 544, 446, 30, White, 1230);
+    } else draw_text(safe(model->status), 544, 446, 30, White, 1230);
     draw_progress(544, 548, 1230, 38, model->install_done_bytes, model->install_total_bytes);
     draw_text("Keep the console on. HOME is available after installation.", 544, 652, 28, Muted, 1230);
+    if (model->current_file_active) draw_file_progress(model, 544, 730, 1230);
 }
 
 void draw_diagnostics_page(const AssistantUiModel *model)
 {
-    draw_panel(414, 150, 1452, 636, Border);
-    draw_text("Diagnostics", 444, 178, 42, White, 560);
+    if (diagnosticTab == 1) draw_setup_check_page(model);
+    else if (diagnosticTab == 2) draw_log_page(model);
+    else if (diagnosticTab == 3) draw_pairing_page(model);
+    else {
+        draw_panel(414, 150, 1452, 702, Border);
+        draw_text("Diagnostics", 444, 178, 42, White, 560);
+        char component[160];
+        std::snprintf(component, sizeof(component), "%s | %s", safe(model->component_version), safe(model->build_id));
+        draw_text(component, 444, 244, 26, Muted, 1300);
+        char space[32], http[96], udp[128], heartbeat[64];
+        size_text(model->sd_free_bytes, space, sizeof(space));
+        std::snprintf(http, sizeof(http), "%u requests, %u errors", model->http_request_count, model->http_error_count);
+        std::snprintf(udp, sizeof(udp), "%u probes, %u replies", model->discovery_probe_count, model->discovery_reply_count);
+        std::snprintf(heartbeat, sizeof(heartbeat), "%u heartbeats", model->loop_heartbeat_count);
+        draw_status_row("SD free", model->sd_space_known ? space : "Unknown", model->sd_space_known, 444, 302, 1280);
+        draw_status_row("HTTP", http, model->http_error_count == 0, 444, 358, 1280);
+        draw_status_row("Discovery", udp, model->broadcast_socket_ready, 444, 414, 1280);
+        draw_status_row("Loop", heartbeat, true, 444, 470, 1280);
+        draw_text(safe(model->controller_summary), 444, 544, 26, Muted, 1320);
+        draw_text("Last request", 444, 602, 26, Muted, 320);
+        draw_text(safe(model->last_http_request), 444, 644, 26, White, 1320);
+        draw_text(model->last_http_error[0] ? model->last_http_error : "No HTTP errors", 444, 718, 28,
+            model->last_http_error[0] ? Danger : Muted, 1320);
+    }
+    const char *tabs[] = {"Status", "Setup", "Log", "Devices"};
+    for (int i = 0; i < DiagnosticTabCount; ++i)
+        draw_button(tabs[i], 444 + i * 344, 886, 324, TouchCommand::DiagnosticTab, i, diagnosticTab == i);
+    if (diagnosticFocused) draw_rect(444 + diagnosticTab * 344, 953, 324, 4, Ready);
+}
 
-    char http[96];
-    std::snprintf(http, sizeof(http), "%u requests, %u errors", model->http_request_count, model->http_error_count);
-    char pairStatus[96];
-    std::snprintf(pairStatus, sizeof(pairStatus), "%u attempts, %u failures", model->pairing_attempt_count, model->pairing_failure_count);
-    char udp[128];
-    std::snprintf(udp, sizeof(udp), "%u probes, %u replies, %u broadcasts", model->discovery_probe_count, model->discovery_reply_count, model->discovery_broadcast_count);
-    char heartbeat[64];
-    std::snprintf(heartbeat, sizeof(heartbeat), "%u heartbeats", model->loop_heartbeat_count);
-    draw_metric("HTTP", http, 444, 262, 320);
-    draw_metric("Pairing", pairStatus, 800, 262, 320);
-    draw_metric("UDP", udp, 1156, 262, 360);
-    draw_metric("Loop", heartbeat, 1552, 262, 220);
+bool settings_equal(const AssistantSettings &a, const AssistantSettings &b)
+{
+    return !assistant_settings_network_changed(&a, &b) && a.simple_ui == b.simple_ui
+        && a.install_enabled == b.install_enabled && a.manual_install_enabled == b.manual_install_enabled
+        && a.auto_install_enabled == b.auto_install_enabled && a.allow_ui_scale == b.allow_ui_scale
+        && a.ui_scale_percent == b.ui_scale_percent;
+}
 
-    draw_text("Last request", 444, 410, 30, Muted, 320);
-    draw_text(safe(model->last_http_request), 444, 452, 28, White, 1250);
-    draw_text("Last error", 444, 522, 30, Muted, 320);
-    draw_text(safe(model->last_http_error), 444, 564, 28, model->last_http_error[0] ? Danger : Dim, 1250);
+bool settings_dirty() { return settingsReady && !settings_equal(settingsSaved, settingsDraft); }
+int settings_rows() { return settingsTab == 1 ? 4 : 3; }
+
+void queue_settings_save()
+{
+    if (!settingsReady || settingsBusy || settingsPending || !settings_dirty()) return;
+    pendingAction = {};
+    pendingAction.type = ASSISTANT_UI_ACTION_SAVE_SETTINGS;
+    pendingAction.settings = settingsDraft;
+    settingsPending = true;
+}
+
+void request_settings_save()
+{
+    if (settingsBusy || settingsPending || !settings_dirty()) return;
+    if (settingsDraft.install_enabled && settingsDraft.auto_install_enabled
+        && !(settingsSaved.install_enabled && settingsSaved.auto_install_enabled))
+    {
+        settingsSaveConfirm = true;
+        autoInstallConfirmOpen = true;
+    }
+    else queue_settings_save();
+}
+
+void edit_setting(int row, int direction, bool openPort)
+{
+    if (!settingsReady || settingsBusy || settingsPending) return;
+    contentFocused = true;
+    settingsFocus = row;
+    if (settingsTab == 0)
+    {
+        if (row == 1) settingsDraft.simple_ui = !settingsDraft.simple_ui;
+        if (row == 2) settingsDraft.allow_ui_scale = !settingsDraft.allow_ui_scale;
+        if (row == 3 && settingsDraft.allow_ui_scale)
+            settingsDraft.ui_scale_percent = std::clamp(settingsDraft.ui_scale_percent + direction, 45, 100);
+    }
+    else if (settingsTab == 1)
+    {
+        if (row == 1) settingsDraft.broadcast_enabled = !settingsDraft.broadcast_enabled;
+        if (row == 2 && settingsDraft.broadcast_enabled)
+            settingsDraft.passive_broadcast_enabled = !settingsDraft.passive_broadcast_enabled;
+        if (row == 3 || row == 4)
+        {
+            int &port = row == 3 ? settingsDraft.http_port : settingsDraft.broadcast_port;
+            if (openPort)
+            {
+                portEditing = row;
+                portText = std::to_string(port);
+                keypadFocus = 11; // Clear is focused so replacing a port needs no repeated backspaces.
+            }
+            else port = std::clamp(port + direction, 1, 65535);
+        }
+    }
+    else
+    {
+        if (row == 1) settingsDraft.install_enabled = !settingsDraft.install_enabled;
+        if (row == 2 && settingsDraft.install_enabled) settingsDraft.manual_install_enabled = !settingsDraft.manual_install_enabled;
+        if (row == 3 && settingsDraft.install_enabled) settingsDraft.auto_install_enabled = !settingsDraft.auto_install_enabled;
+    }
+}
+
+int entered_port()
+{
+    if (portText.empty() || portText.size() > 5) return 0;
+    int n = 0;
+    for (char c : portText) { if (c < '0' || c > '9') return 0; n = n * 10 + c - '0'; }
+    return n >= 1 && n <= 65535 ? n : 0;
+}
+
+void port_key(int key)
+{
+    if (key == 12) { portEditing = -1; return; }
+    if (settingsBusy || settingsPending) return;
+    if (key == 13)
+    {
+        int port = entered_port();
+        if (!port) return;
+        if (portEditing == 3) settingsDraft.http_port = port;
+        else settingsDraft.broadcast_port = port;
+        portEditing = -1;
+    }
+    else if (key == 9) { if (!portText.empty()) portText.pop_back(); }
+    else if (key == 11) portText.clear();
+    else if (key >= 0 && key <= 10 && portText.size() < 5) portText += key == 10 ? '0' : '1' + key;
+}
+
+void draw_port_editor()
+{
+    touchTargets.clear();
+    draw_panel(650, 150, 890, 820, Accent);
+    draw_text(portEditing == 3 ? "HTTP port" : "Discovery port (UDP)", 700, 190, 38, White, 790);
+    draw_text(portText.empty() ? "_" : portText.c_str(), 700, 254, 48, White, 760);
+    draw_text("Valid range: 1-65535", 700, 320, 25, entered_port() ? Muted : Warn, 750);
+    const char *keys[] = {"1","2","3","4","5","6","7","8","9","Backspace","0","Clear","Cancel","Apply"};
+    for (int i = 0; i < 12; i++)
+        draw_button(keys[i], 700 + (i % 3) * 260, 382 + (i / 3) * 92, 238, TouchCommand::PortKey, i, keypadFocus == i, !settingsBusy);
+    draw_button(keys[12], 700, 824, 350, TouchCommand::PortKey, 12, keypadFocus == 12);
+    draw_button(keys[13], 1090, 824, 368, TouchCommand::PortKey, 13, keypadFocus == 13, !settingsBusy && entered_port());
+}
+
+void draw_setting_toggle(const char *label, int row, bool value, bool enabled = true)
+{
+    int y = 330 + (row - 1) * 104;
+    bool focus = contentFocused && settingsFocus == row;
+    draw_rect(444, y, 1360, 80, focus ? FieldBackground : AppBackground);
+    draw_rect(472, y + 22, 36, 36, enabled ? Border : FieldBackground);
+    if (value) draw_text("X", 479, y + 25, 27, enabled ? Ready : Dim, 28);
+    draw_text(label, 534, y + 23, 30, enabled ? White : Dim, 1200);
+    if (enabled && !settingsBusy && !settingsPending) add_touch_target(444, y, 1360, 80, TouchCommand::Setting, row);
 }
 
 void draw_config_page(const AssistantUiModel *model)
 {
-    draw_panel(414, 150, 1452, 636, Border);
-    draw_text("Config Info", 444, 178, 42, White, 520);
-    draw_text("Config", 444, 254, 30, Muted, 260);
-    draw_text("sd:/wiiu/apps/uinjectforge-assistant/config.json", 444, 300, 32, White, 1000);
-    draw_text("Log", 444, 356, 30, Muted, 200);
-    draw_text("sd:/uinjectforge/assistant/assistant.log", 444, 398, 30, White, 900);
-
-    char httpPort[64];
-    char broadcastPort[64];
-    std::snprintf(httpPort, sizeof(httpPort), "%d", model->http_port);
-    std::snprintf(broadcastPort, sizeof(broadcastPort), "%d", model->broadcast_port);
-    draw_metric("HTTP", httpPort, 444, 490, 260);
-    draw_metric("UDP", broadcastPort, 740, 490, 300);
-    draw_metric("UDP discovery", model->broadcast_enabled ? "enabled" : "off", 1076, 490, 300);
-    draw_metric("UI", simpleUi ? "receiver" : "dashboard", 1412, 490, 360);
-
-    draw_text(model->manual_install_enabled ? "Manual install: enabled" : "Manual install: disabled", 444, 610, 28, model->manual_install_enabled ? Ready : Muted, 620);
-    draw_button(
-        model->auto_install_enabled ? "Automatic installs: On" : "Automatic installs: Off",
-        1010,
-        590,
-        520,
-        TouchCommand::AutoInstall,
-        0,
-        model->auto_install_enabled,
-        model->install_enabled);
-    draw_text(model->install_enabled ? "A or tap to change this setting." : "Install assistance is disabled by config.json.", 444, 682, 26, model->install_enabled ? Muted : Warn, 1040);
-    char component[160];
-    std::snprintf(component, sizeof(component), "Version %s | Build %s", safe(model->component_version), safe(model->build_id));
-    draw_text(component, 444, 734, 25, Dim, 1120);
+    draw_text(settings_dirty() ? "Settings *" : "Settings", 444, 174, 42, White, 850);
+    const char *tabs[] = {"Interface", "Network", "Installation"};
+    for (int i = 0; i < 3; i++)
+        draw_button(tabs[i], 444 + i * 454, 248, 434, TouchCommand::SettingsTab, i, settingsTab == i);
+    if (contentFocused && settingsFocus == 0) draw_rect(444 + settingsTab * 454, 315, 434, 4, Ready);
+    if (settingsTab == 0)
+    {
+        draw_text("Startup view", 472, 354, 30, White, 440);
+        draw_button("Receiver", 990, 340, 380, TouchCommand::Setting, 1, settingsDraft.simple_ui, !settingsBusy && !settingsPending);
+        draw_button("Dashboard", 1390, 340, 384, TouchCommand::Setting, -1, !settingsDraft.simple_ui, !settingsBusy && !settingsPending);
+        if (contentFocused && settingsFocus == 1) draw_rect(472, 411, 1302, 3, Ready);
+        draw_setting_toggle("Custom display size", 2, settingsDraft.allow_ui_scale);
+        draw_text("Display size", 472, 562, 30, settingsDraft.allow_ui_scale ? White : Dim, 440);
+        char scale[32]; std::snprintf(scale, sizeof(scale), "%d%%", settingsDraft.ui_scale_percent);
+        draw_text(scale, 1280, 562, 32, White, 180);
+        bool enabled = settingsDraft.allow_ui_scale && !settingsBusy && !settingsPending;
+        draw_button("-", 990, 548, 240, TouchCommand::SettingDecrease, 3, contentFocused && settingsFocus == 3, enabled);
+        draw_button("+", 1534, 548, 240, TouchCommand::SettingIncrease, 3, contentFocused && settingsFocus == 3, enabled);
+    }
+    else if (settingsTab == 1)
+    {
+        draw_setting_toggle("Local network discovery", 1, settingsDraft.broadcast_enabled);
+        draw_setting_toggle("Periodic discovery broadcasts", 2, settingsDraft.passive_broadcast_enabled, settingsDraft.broadcast_enabled);
+        for (int row = 3; row <= 4; row++)
+        {
+            int y = 330 + (row - 1) * 104;
+            draw_text(row == 3 ? "HTTP port" : "Discovery port (UDP)", 472, y + 23, 30, White, 790);
+            std::string port = std::to_string(row == 3 ? settingsDraft.http_port : settingsDraft.broadcast_port);
+            draw_button(port.c_str(), 1374, y + 8, 400, TouchCommand::Setting, row,
+                contentFocused && settingsFocus == row, !settingsBusy && !settingsPending);
+        }
+    }
+    else
+    {
+        draw_setting_toggle("Allow installation", 1, settingsDraft.install_enabled);
+        draw_setting_toggle("Install from Packages", 2, settingsDraft.manual_install_enabled, settingsDraft.install_enabled);
+        draw_setting_toggle("Automatic installs from paired devices", 3, settingsDraft.auto_install_enabled, settingsDraft.install_enabled);
+        draw_text("Automatic installs still require Copy and install for each transfer.", 472, 668, 26, Muted, 1290);
+    }
+    const char *status = settingsBusy ? "Finish the transfer or installation before saving settings."
+        : settingsPending ? "Saving to SD..."
+        : model->settings_message[0] && !model->settings_save_ok ? model->settings_message
+        : settings_dirty() ? "Unsaved changes"
+        : model->settings_message[0] ? model->settings_message : "No unsaved changes.";
+    draw_text(status, 472, 734, 26, settingsBusy || (!model->settings_save_ok && model->settings_message[0]) ? Warn : Muted, 1290);
+    if (model->settings_restart_required || assistant_settings_network_changed(&settingsSaved, &settingsDraft))
+        draw_text("Network changes take effect after restarting Assistant.", 472, 782, 26, Warn, 1290);
+    int rows = settings_rows();
+    draw_button("Restore defaults", 472, 856, 440, TouchCommand::SettingsDefaults, 0, contentFocused && settingsFocus == rows + 1, !settingsBusy && !settingsPending);
+    draw_button("Cancel changes", 976, 856, 390, TouchCommand::SettingsCancel, 0, contentFocused && settingsFocus == rows + 2, !settingsPending && settings_dirty());
+    draw_button("Save", 1430, 856, 344, TouchCommand::SettingsSave, 0, contentFocused && settingsFocus == rows + 3, !settingsBusy && !settingsPending && settings_dirty());
 }
 
 void draw_simple_ui(const AssistantUiModel *model)
@@ -1798,15 +1843,12 @@ void draw_simple_ui(const AssistantUiModel *model)
     draw_rect(0, 100, DesignWidth, 4, Accent);
     draw_brand_mark(54, 28);
     draw_text("UInjectForge Assistant", 108, 24, 44, White, 700);
-    char component[160];
-    std::snprintf(component, sizeof(component), "v%s | %s", safe(model->component_version), safe(model->build_id));
-    draw_text(component, 824, 39, 23, Dim, 620);
     draw_status_pill(model->connection_state, stateColor, 1518, 24, 340);
 
     char endpoint[160];
     std::snprintf(endpoint, sizeof(endpoint), "%s:%d", model->ip_address[0] ? model->ip_address : "waiting", model->http_port);
     char pair[32];
-    std::snprintf(pair, sizeof(pair), "%06u", model->pairing_code);
+    format_pairing_code(model, pair, sizeof(pair));
 
     draw_panel(54, 142, 860, 354, model->paired ? Ready : AccentDark);
     draw_text(model->startup_active ? "Starting Assistant" : model->paired ? "Paired" : "Pairing Code", 92, 182, 42, White, 720);
@@ -1814,10 +1856,9 @@ void draw_simple_ui(const AssistantUiModel *model)
     draw_text(model->startup_active ? safe(model->status) : model->paired ? "Ready for transfers from UIF." : "Enter this code in UIF.", 96, 396, 30, Muted, 720);
 
     draw_panel(952, 142, 914, 354, Border);
-    draw_text("Receiver", 990, 182, 42, White, 520);
+    draw_text("Connection", 990, 182, 42, White, 520);
     draw_compact_metric("Address", endpoint, 990, 254, 520);
-    draw_compact_metric("SD", safe(model->sd_root), 1538, 254, 268);
-    draw_text("Keep open during transfers.", 990, 396, 28, Muted, 430);
+    if (model->paired) draw_compact_metric("Code", pair, 1538, 254, 268);
     if (model->startup_active)
         draw_text("Settings available when ready.", 1440, 410, 27, Dim, 366);
     else
@@ -1829,37 +1870,46 @@ void draw_simple_ui(const AssistantUiModel *model)
             TouchCommand::AutoInstall,
             0,
             model->auto_install_enabled,
-            model->install_enabled);
+            model->install_enabled && !settingsBusy && !settingsPending && !settings_dirty());
 
     draw_panel(54, 530, 1812, 292, model->transfer_active ? Accent : Border);
-    draw_text("Transfer", 92, 570, 42, White, 420);
-    draw_text(model->transfer_active ? safe(model->package_display_name) : "Waiting for UIF", 92, 630, 36, White, 1150);
+    draw_text(model->verifying_files ? "Verifying SD" : model->transfer_active ? "Receiving"
+        : model->last_transfer_has_result ? "Last transfer" : "Receiver", 92, 570, 42, White, 750);
+    draw_text(model->transfer_active ? safe(model->package_display_name) : model->last_transfer_has_result
+        ? safe(model->last_transfer_package_display_name) : "Waiting for UIF", 92, 630, 36, White, 1150);
     if (!model->startup_active)
-        draw_button("Packages & tools", 1410, 566, 396, TouchCommand::Dashboard);
-    char files[80];
-    std::snprintf(files, sizeof(files), "%d / %d files", model->uploaded_files, model->file_count);
-    char uploaded[32];
-    char total[32];
-    size_text(model->uploaded_bytes, uploaded, sizeof(uploaded));
-    size_text(model->total_bytes, total, sizeof(total));
-    char bytes[96];
-    std::snprintf(bytes, sizeof(bytes), "%s / %s", uploaded, total);
-    draw_compact_metric("Files", files, 92, 714, 300);
-    draw_compact_metric("Bytes", bytes, 430, 714, 360);
-    draw_progress(840, 744, 820, 30, model->uploaded_bytes, model->total_bytes);
+    {
+        draw_button("Settings", 1060, 566, 320, TouchCommand::Settings);
+        draw_button("Packages", 1410, 566, 396, TouchCommand::Dashboard);
+    }
+    if (model->transfer_active) {
+        char files[80];
+        std::snprintf(files, sizeof(files), "%d / %d files", model->uploaded_files, model->file_count);
+        char uploaded[32];
+        char total[32];
+        size_text(model->verifying_files ? model->verified_bytes : model->uploaded_bytes, uploaded, sizeof(uploaded));
+        size_text(model->total_bytes, total, sizeof(total));
+        char bytes[96];
+        std::snprintf(bytes, sizeof(bytes), "%s / %s", uploaded, total);
+        draw_compact_metric("Files", files, 92, 714, 300);
+        draw_compact_metric("Bytes", bytes, 430, 714, 360);
+        draw_progress(840, 744, 820, 30, model->verifying_files ? model->verified_bytes : model->uploaded_bytes, model->total_bytes);
+        draw_batch_percentage(model, 1690, 740, 116);
+    } else if (model->last_transfer_has_result) {
+        draw_text(safe(model->last_transfer_message), 92, 714, 30,
+            model->last_transfer_success ? Ready : model->last_transfer_canceled ? Warn : Danger, 1714);
+    }
 
-    draw_panel(54, 856, 1812, 138, Border);
-    draw_text("Latest", 92, 890, 32, Muted, 260);
-    const char *latest = model->activity_count > 0 ? model->activity_log[model->activity_count - 1] : safe(model->status);
-    draw_text(latest, 250, 890, 30, White, 1260);
-    draw_text("HOME", 1660, 890, 30, Muted, 160);
+    if (model->current_file_active) {
+        draw_panel(54, 856, 1812, 138, Border);
+        draw_file_progress(model, 92, 874, 1714);
+    } else if (!model->last_transfer_has_result) {
+        draw_panel(54, 856, 1812, 138, Border);
+        draw_text("Latest", 92, 890, 32, Muted, 260);
+        const char *latest = model->activity_count > 0 ? model->activity_log[model->activity_count - 1] : safe(model->status);
+        draw_text(latest, 250, 890, 30, White, 1260);
+    }
 
-    draw_text("A Refresh", 62, 1022, 27, Dim, 260);
-    if (!model->startup_active)
-        draw_text("X Auto install", 330, 1022, 27, Dim, 330);
-    draw_text("HOME Menu", model->startup_active ? 330 : 690, 1022, 27, Dim, 280);
-    if (!model->startup_active)
-        draw_text("Y / Wii Remote 2: Packages & tools", 1040, 1022, 27, Dim, 790);
     if (autoInstallConfirmOpen)
         draw_auto_install_confirmation();
     SDL_RenderPresent(renderer);
@@ -1946,9 +1996,21 @@ extern "C" void assistant_ui_render(const AssistantUiModel *model)
     cachedInstallEnabled = model->install_enabled && model->manual_install_enabled;
     cachedInstallGloballyEnabled = model->install_enabled;
     cachedAutoInstallEnabled = model->auto_install_enabled;
+    settingsBusy = model->settings_busy || model->transfer_active || model->install_active || model->startup_active;
+    if (!settingsReady || (!settings_dirty() && !settingsPending)
+        || (settingsPending && model->settings_revision != settingsRevision && model->settings_save_ok))
+    {
+        settingsSaved = model->settings;
+        settingsDraft = model->settings;
+        settingsReady = assistant_settings_valid(&model->settings);
+    }
+    if (settingsPending && model->settings_revision != settingsRevision) settingsPending = false;
+    settingsRevision = model->settings_revision;
     installActive = model->install_active;
+    pairingChangesAllowed = !model->install_active && !model->transfer_active && !model->startup_active;
+    if (!pairingChangesAllowed) forgetDevicesConfirmOpen = false;
     startupActive = model->startup_active;
-    simpleUi = model->simple_ui && !dashboardOpen;
+    simpleUi = (model->simple_ui || receiverOpen) && !dashboardOpen;
     touchTargets.clear();
     if (cachedSdRoot != model->sd_root)
     {
@@ -1981,10 +2043,7 @@ extern "C" void assistant_ui_render(const AssistantUiModel *model)
     draw_rect(0, 112, DesignWidth, 4, Accent);
     draw_brand_mark(48, 28);
     draw_text("UInjectForge Assistant", 102, 24, 48, White, 760);
-    char component[160];
-    std::snprintf(component, sizeof(component), "v%s | %s", safe(model->component_version), safe(model->build_id));
-    draw_text(component, 102, 78, 23, Dim, 760);
-    draw_topbar_connection(model);
+    if (selectedPage != 0 || installActive) draw_topbar_connection(model);
 
     SDL_Color stateColor = Ready;
     if (installActive || std::strcmp(model->connection_state, "Transfer Active") == 0)
@@ -2000,54 +2059,14 @@ extern "C" void assistant_ui_render(const AssistantUiModel *model)
         draw_install_progress(model);
     else switch (selectedPage)
     {
-        case 0:
-            draw_overview_page(model);
-            break;
-        case 1:
-            draw_receiver_page(model);
-            break;
-        case 2:
-            draw_pairing_page(model);
-            break;
-        case 3:
-            draw_transfer_page(model);
-            break;
-        case 4:
-            draw_results_page(model);
-            break;
-        case 5:
-            draw_activity_page(model);
-            break;
-        case 6:
-            draw_sd_packages_page(model);
-            break;
-        case 7:
-            draw_log_page(model);
-            break;
-        case 8:
-            draw_installed_page();
-            break;
-        case 9:
-            draw_network_page(model);
-            break;
-        case 10:
-            draw_health_page(model);
-            break;
-        case 11:
-            draw_setup_check_page(model);
-            break;
-        case 12:
-            draw_diagnostics_page(model);
-            break;
-        case 13:
-            draw_controls_page(model);
-            break;
-        case 14:
-            draw_config_page(model);
-            break;
+        case 0: draw_receiver_page(model); break;
+        case PackagesPageIndex: draw_sd_packages_page(model); break;
+        case InstalledTitlesPageIndex: draw_installed_page(); break;
+        case ConfigPageIndex: draw_config_page(model); break;
+        case DiagnosticsPageIndex: draw_diagnostics_page(model); break;
         default:
             selectedPage = 0;
-            draw_overview_page(model);
+            draw_receiver_page(model);
             break;
     }
 
@@ -2056,18 +2075,18 @@ extern "C" void assistant_ui_render(const AssistantUiModel *model)
         draw_text("Installation in progress", 54, 1022, 30, Warn, 1360);
     else
     {
-        draw_text(contentFocused ? "Up/Down Items" : "Up/Down Pages", 54, 1022, 30, White, 350);
-        draw_text(contentFocused ? "A Choose    B Back" : "A Open", 454, 1022, 30, Muted, 400);
-        draw_text("X Refresh", 920, 1022, 30, Muted, 240);
-        draw_text("HOME Menu", 1190, 1022, 30, Muted, 260);
         if (dashboardOpen)
-            draw_button("Y Receiver", 1530, 1010, 300, TouchCommand::Receiver);
-        if (selectedPage != PackagesPageIndex && selectedPage != InstalledTitlesPageIndex)
-            draw_button("Refresh", 1620, 912, 210, TouchCommand::Refresh);
+            draw_button("Receiver", 1530, 1010, 300, TouchCommand::Receiver);
+        if (selectedPage == DiagnosticsPageIndex || selectedPage == 0)
+            draw_button("Refresh", 82, 898, 274, TouchCommand::Refresh);
         if (installConfirmOpen || launchConfirmOpen)
             draw_confirmation();
         else if (autoInstallConfirmOpen)
             draw_auto_install_confirmation();
+        else if (forgetDevicesConfirmOpen)
+            draw_forget_devices_confirmation();
+        else if (portEditing >= 0)
+            draw_port_editor();
     }
 
     SDL_RenderPresent(renderer);
@@ -2076,16 +2095,20 @@ extern "C" void assistant_ui_render(const AssistantUiModel *model)
 
 void select_page(int page)
 {
+    forgetDevicesConfirmOpen = false;
     selectedPage = std::clamp(page, 0, PageCount - 1);
+    diagnosticFocused = false;
     contentFocused = false;
     installConfirmOpen = false;
     launchConfirmOpen = false;
     autoInstallConfirmOpen = false;
+    settingsSaveConfirm = false;
+    portEditing = -1;
     if (selectedPage == PackagesPageIndex)
         packagesLoaded = false;
     if (selectedPage == InstalledTitlesPageIndex)
         installedTitlesLoaded = false;
-    if (selectedPage == 11)
+    if (selectedPage == DiagnosticsPageIndex && diagnosticTab == 1)
         setupLoaded = false;
     refreshRequested = true;
 }
@@ -2095,14 +2118,30 @@ bool handle_navigation_buttons(uint32_t trigger)
     if (!trigger || installActive || startupActive)
         return false;
 
+    if (portEditing >= 0)
+    {
+        if (trigger & VPAD_BUTTON_B) portEditing = -1;
+        else if (trigger & VPAD_BUTTON_A) port_key(keypadFocus);
+        else if (trigger & VPAD_BUTTON_LEFT) keypadFocus = (keypadFocus + 13) % 14;
+        else if (trigger & VPAD_BUTTON_RIGHT) keypadFocus = (keypadFocus + 1) % 14;
+        else if (trigger & VPAD_BUTTON_UP) keypadFocus = (keypadFocus + 11) % 14;
+        else if (trigger & VPAD_BUTTON_DOWN) keypadFocus = (keypadFocus + 3) % 14;
+        refreshRequested = true;
+        return true;
+    }
+
     if ((trigger & VPAD_BUTTON_B) != 0)
     {
-        if (installConfirmOpen || launchConfirmOpen || autoInstallConfirmOpen)
+        if (installConfirmOpen || launchConfirmOpen || autoInstallConfirmOpen || forgetDevicesConfirmOpen)
         {
+            forgetDevicesConfirmOpen = false;
             installConfirmOpen = false;
             launchConfirmOpen = false;
             autoInstallConfirmOpen = false;
+            settingsSaveConfirm = false;
         }
+        else if (selectedPage == DiagnosticsPageIndex && diagnosticFocused)
+            diagnosticFocused = false;
         else if (contentFocused)
             contentFocused = false;
         else
@@ -2111,13 +2150,30 @@ bool handle_navigation_buttons(uint32_t trigger)
         return true;
     }
 
-    if (autoInstallConfirmOpen)
+    if (forgetDevicesConfirmOpen)
     {
-        if ((trigger & VPAD_BUTTON_A) != 0)
+        if ((trigger & VPAD_BUTTON_A) != 0 && pairingChangesAllowed)
         {
             std::memset(&pendingAction, 0, sizeof(pendingAction));
-            pendingAction.type = ASSISTANT_UI_ACTION_SET_AUTO_INSTALL;
-            pendingAction.enabled = !cachedAutoInstallEnabled;
+            pendingAction.type = ASSISTANT_UI_ACTION_FORGET_DEVICES;
+            forgetDevicesConfirmOpen = false;
+        }
+        refreshRequested = true;
+        return true;
+    }
+
+    if (autoInstallConfirmOpen)
+    {
+        if ((trigger & VPAD_BUTTON_A) != 0 && !settingsBusy && !settingsPending)
+        {
+            if (settingsSaveConfirm) queue_settings_save();
+            else
+            {
+                std::memset(&pendingAction, 0, sizeof(pendingAction));
+                pendingAction.type = ASSISTANT_UI_ACTION_SET_AUTO_INSTALL;
+                pendingAction.enabled = !cachedAutoInstallEnabled;
+            }
+            settingsSaveConfirm = false;
             autoInstallConfirmOpen = false;
         }
         refreshRequested = true;
@@ -2129,11 +2185,12 @@ bool handle_navigation_buttons(uint32_t trigger)
         if ((trigger & VPAD_BUTTON_Y) != 0)
         {
             dashboardOpen = true;
+            receiverOpen = false;
             simpleUi = false;
             select_page(PackagesPageIndex);
             return true;
         }
-        if ((trigger & VPAD_BUTTON_X) != 0 && cachedInstallGloballyEnabled)
+        if ((trigger & VPAD_BUTTON_X) != 0 && cachedInstallGloballyEnabled && !settingsBusy && !settings_dirty())
         {
             autoInstallConfirmOpen = true;
             refreshRequested = true;
@@ -2178,8 +2235,49 @@ bool handle_navigation_buttons(uint32_t trigger)
     if ((trigger & VPAD_BUTTON_Y) != 0 && dashboardOpen)
     {
         dashboardOpen = false;
+        receiverOpen = true;
         simpleUi = true;
         select_page(0);
+        return true;
+    }
+
+    if (selectedPage == ConfigPageIndex && contentFocused)
+    {
+        int rows = settings_rows();
+        if (trigger & VPAD_BUTTON_UP) settingsFocus = (settingsFocus + rows + 3) % (rows + 4);
+        else if (trigger & VPAD_BUTTON_DOWN) settingsFocus = (settingsFocus + 1) % (rows + 4);
+        else if (trigger & (VPAD_BUTTON_A | VPAD_BUTTON_LEFT | VPAD_BUTTON_RIGHT))
+        {
+            int direction = trigger & VPAD_BUTTON_LEFT ? -1 : 1;
+            if (settingsFocus == 0) settingsTab = (settingsTab + direction + 3) % 3;
+            else if (settingsFocus <= rows) edit_setting(settingsFocus, direction, (trigger & VPAD_BUTTON_A) != 0);
+            else if (trigger & VPAD_BUTTON_A)
+            {
+                if (settingsFocus == rows + 1 && !settingsBusy && !settingsPending) settingsDraft = assistant_settings_defaults();
+                else if (settingsFocus == rows + 2 && !settingsPending) settingsDraft = settingsSaved;
+                else if (settingsFocus == rows + 3) request_settings_save();
+            }
+        }
+        refreshRequested = true;
+        return true;
+    }
+
+    if (selectedPage == DiagnosticsPageIndex && diagnosticFocused)
+    {
+        if (trigger & (VPAD_BUTTON_LEFT | VPAD_BUTTON_RIGHT | VPAD_BUTTON_UP | VPAD_BUTTON_DOWN))
+        {
+            int direction = trigger & (VPAD_BUTTON_LEFT | VPAD_BUTTON_UP) ? -1 : 1;
+            diagnosticTab = (diagnosticTab + direction + DiagnosticTabCount) % DiagnosticTabCount;
+            setupLoaded = false;
+        }
+        else if ((trigger & VPAD_BUTTON_A) && diagnosticTab == 3 && pairingChangesAllowed)
+            forgetDevicesConfirmOpen = true;
+        else if (trigger & VPAD_BUTTON_X)
+        {
+            storageRefreshRequested = true;
+            assistant_ui_invalidate_storage();
+        }
+        refreshRequested = true;
         return true;
     }
 
@@ -2198,9 +2296,16 @@ bool handle_navigation_buttons(uint32_t trigger)
             select_page((selectedPage + 1) % PageCount);
         else if ((trigger & VPAD_BUTTON_A) != 0)
         {
-            if (selectedPage == ConfigPageIndex && cachedInstallGloballyEnabled)
+            if (selectedPage == DiagnosticsPageIndex)
             {
-                autoInstallConfirmOpen = true;
+                diagnosticFocused = true;
+                refreshRequested = true;
+                return true;
+            }
+            if (selectedPage == ConfigPageIndex)
+            {
+                contentFocused = true;
+                settingsFocus = 0;
                 refreshRequested = true;
                 return true;
             }
@@ -2240,18 +2345,50 @@ void handle_touch_command(const TouchTarget &target)
         return;
     switch (target.command)
     {
+        case TouchCommand::Settings:
+            dashboardOpen = true;
+            receiverOpen = false;
+            simpleUi = false;
+            select_page(ConfigPageIndex);
+            contentFocused = true;
+            settingsFocus = 0;
+            break;
+        case TouchCommand::SettingsTab:
+            settingsTab = std::clamp(target.value, 0, 2);
+            contentFocused = true;
+            settingsFocus = 0;
+            break;
+        case TouchCommand::DiagnosticTab:
+            diagnosticTab = std::clamp(target.value, 0, DiagnosticTabCount - 1);
+            diagnosticFocused = true;
+            setupLoaded = false;
+            refreshRequested = true;
+            break;
+        case TouchCommand::Setting:
+            if (settingsTab == 0 && (target.value == 1 || target.value == -1))
+            {
+                if (!settingsBusy && !settingsPending) settingsDraft.simple_ui = target.value == 1;
+                contentFocused = true;
+                settingsFocus = 1;
+            }
+            else edit_setting(target.value, 1, true);
+            break;
+        case TouchCommand::SettingDecrease: edit_setting(target.value, -1, false); break;
+        case TouchCommand::SettingIncrease: edit_setting(target.value, 1, false); break;
+        case TouchCommand::SettingsDefaults:
+            if (!settingsBusy && !settingsPending) settingsDraft = assistant_settings_defaults();
+            break;
+        case TouchCommand::SettingsCancel:
+            if (!settingsPending) settingsDraft = settingsSaved;
+            break;
+        case TouchCommand::SettingsSave: request_settings_save(); break;
+        case TouchCommand::PortKey: port_key(target.value); break;
         case TouchCommand::Dashboard:
         case TouchCommand::Receiver:
             handle_navigation_buttons(VPAD_BUTTON_Y);
             break;
         case TouchCommand::Page:
             select_page(target.value);
-            break;
-        case TouchCommand::SidebarUp:
-            select_page(std::max(0, sidebarStart - SidebarVisibleCount));
-            break;
-        case TouchCommand::SidebarDown:
-            select_page(std::min(PageCount - 1, sidebarStart + SidebarVisibleCount));
             break;
         case TouchCommand::Package:
             if (target.value >= 0 && target.value < static_cast<int>(cachedInstallPackages.size()))
@@ -2292,8 +2429,11 @@ void handle_touch_command(const TouchTarget &target)
                 selectedInstallTarget = 1;
             break;
         case TouchCommand::AutoInstall:
-            if (cachedInstallGloballyEnabled)
+            if (cachedInstallGloballyEnabled && !settingsBusy && !settingsPending && !settings_dirty())
                 autoInstallConfirmOpen = true;
+            break;
+        case TouchCommand::ForgetDevices:
+            if (pairingChangesAllowed) forgetDevicesConfirmOpen = true;
             break;
     }
     refreshRequested = true;
@@ -2507,5 +2647,5 @@ extern "C" void assistant_ui_set_install_active(bool active)
 
 extern "C" bool assistant_ui_needs_log_tail(void)
 {
-    return !simpleUi && !installActive && selectedPage == 7;
+    return !simpleUi && !installActive && selectedPage == DiagnosticsPageIndex && diagnosticTab == 2;
 }

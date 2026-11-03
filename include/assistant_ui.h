@@ -2,6 +2,7 @@
 #define ASSISTANT_UI_H
 
 #include <stdbool.h>
+#include "assistant_settings.h"
 
 #define ASSISTANT_UI_ACTIVITY_LINES 8
 #define ASSISTANT_UI_LOG_LINES 10
@@ -25,6 +26,8 @@ typedef struct
     unsigned int activity_count;
     unsigned int log_tail_count;
     unsigned int pairing_code;
+    bool pairing_code_persisted;
+    unsigned int trusted_device_count;
     unsigned int http_request_count;
     unsigned int http_error_count;
     unsigned int pairing_attempt_count;
@@ -46,6 +49,12 @@ typedef struct
     bool manual_install_enabled;
     bool auto_install_enabled;
     bool install_active;
+    AssistantSettings settings;
+    bool settings_busy;
+    bool settings_restart_required;
+    bool settings_save_ok;
+    unsigned int settings_revision;
+    char settings_message[ASSISTANT_UI_TEXT];
     long long install_done_bytes;
     long long install_total_bytes;
     bool sd_space_known;
@@ -64,6 +73,14 @@ typedef struct
     int uploaded_files;
     long long total_bytes;
     long long uploaded_bytes;
+    bool current_file_active;
+    bool verifying_files;
+    char current_file_path[256];
+    long long current_file_bytes;
+    long long current_file_total_bytes;
+    long long verified_bytes;
+    double current_file_bytes_per_second;
+    unsigned int current_file_idle_seconds;
     bool last_transfer_has_result;
     bool last_transfer_success;
     bool last_transfer_canceled;
@@ -88,6 +105,8 @@ typedef enum
     ASSISTANT_UI_ACTION_INSTALL_TO_USB,
     ASSISTANT_UI_ACTION_LAUNCH_TITLE,
     ASSISTANT_UI_ACTION_SET_AUTO_INSTALL,
+    ASSISTANT_UI_ACTION_FORGET_DEVICES,
+    ASSISTANT_UI_ACTION_SAVE_SETTINGS,
 } AssistantUiActionType;
 
 typedef struct
@@ -97,6 +116,7 @@ typedef struct
     char title_id[17];
     char title_name[256];
     bool enabled;
+    AssistantSettings settings;
 } AssistantUiAction;
 
 #ifdef __cplusplus
