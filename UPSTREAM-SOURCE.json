@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "status": "SOURCE_PREPARATION_FINAL_PRIMARY_REFRESH_REQUIRED",
+  "status": "SOURCE_MAPPING_VERIFIED_FINAL_PRIMARY",
   "upstreamRepository": "ZestyTS/UInjectForge",
-  "upstreamCommit": "6ceff8db586869231966b0521c175bb796c63df7",
+  "upstreamCommit": "04366fc389338700c6ad50eb86071207731cdfef",
   "upstreamComponent": "tools/UInjectForge.Assistant.WiiU",
   "componentVersion": "1.0.6",
   "nativeFingerprintInputCount": 77,
@@ -471,5 +471,5 @@
     }
   ],
   "standaloneAdaptation": "Keep standalone release/build/workflow/package files; componentREADME synchronized asREFERENCE.md; standaloneREADME/PUBLICATION adapted and standalone.gitignore preserved. Native inputs remain byte-exact.",
-  "finalization": "Refresh mapping from reviewed final primary; normal versioned build/provenance, notices, exact public source/package and native activation acceptance before release. No build or publication established by this file."
+  "finalization": "Record the versioned build provenance, notices, exact source and package hashes, and applicable native activation acceptance before release."
 }

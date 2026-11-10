@@ -1,11 +1,11 @@
 # Standalone source
 
-The 1.0.6 preparation synchronizes the reviewed component from UInjectForge
-commit `6ceff8db586869231966b0521c175bb796c63df7`, directory
-`tools/UInjectForge.Assistant.WiiU`. `UPSTREAM-SOURCE.json` pins all 77 native
-fingerprint inputs by relative path, size and SHA-256. Standalone documentation
-and release automation remain separate. Refresh the mapping from the final
-reviewed primary source before shipping; a source preparation is not a release.
+This Assistant 1.0.6 source offer corresponds to the reviewed UInjectForge
+primary commit `04366fc389338700c6ad50eb86071207731cdfef` and its
+`tools/UInjectForge.Assistant.WiiU` directory. `UPSTREAM-SOURCE.json` pins all 77
+native fingerprint inputs by relative path, Git mode, size and SHA-256.
+Verify the matching Assistant binary package and its build provenance before
+publishing the pair.
 
 The older September preview remains tied to standalone commit
 `0aa98695437f2c9f5ffe7626a5a64e0addc0a5a1`. New builds must record their exact
