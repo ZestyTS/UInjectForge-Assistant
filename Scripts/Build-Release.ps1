@@ -8,6 +8,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'NativeSource.ps1')
 function Invoke-Checked([string]$Program, [string[]]$Arguments) {
     & $Program @Arguments
     if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE." }
@@ -18,13 +19,17 @@ try {
     $status = @(Invoke-Checked git @('status', '--porcelain'))
     if ($status.Count) { throw 'Commit reviewed changes before building a release; the checkout must be clean.' }
     $commit = (Invoke-Checked git @('rev-parse', 'HEAD')).Trim()
-    $buildId = $commit.Substring(0, 12)
     $output = Join-Path $root ("artifacts/$Version-" + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
     $null = New-Item -ItemType Directory -Path $output
-    $sourceArchive = Join-Path $output 'source.zip'
+    $sourceArchiveName = "UInjectForge-Assistant-$Version-Source.zip"
+    $sourceArchive = Join-Path $output $sourceArchiveName
     Invoke-Checked git @('archive', '--format=zip', "--output=$sourceArchive", $commit)
     $source = Join-Path $output 'source'
     [IO.Compression.ZipFile]::ExtractToDirectory($sourceArchive, $source)
+    $sourceFingerprint = Assert-UifNativeSourceMapping -ProjectRoot $source
+    $sourceMap = Get-Content -LiteralPath (Join-Path $source 'UPSTREAM-SOURCE.json') -Raw | ConvertFrom-Json
+    if ($sourceMap.componentVersion -cne $Version) { throw 'Requested component version differs from the reviewed source mapping.' }
+    $buildId = "src-$($sourceFingerprint.Substring(0, 12))"
 
     $builder = 'uinjectforge-assistant-release-builder'
     $tester = 'uinjectforge-assistant-release-tests'
@@ -32,9 +37,11 @@ try {
     Invoke-Checked docker @('build', '-t', $tester, '-f', (Join-Path $source 'tests/Dockerfile.host'), $source)
     $builderId = (Invoke-Checked docker @('image', 'inspect', '--format', '{{.Id}}', $builder)).Trim()
     $testerId = (Invoke-Checked docker @('image', 'inspect', '--format', '{{.Id}}', $tester)).Trim()
-    $mount = "${source}:/app"
-    Invoke-Checked docker @('run', '--rm', '--network', 'none', '-v', $mount, '-w', '/app', $testerId, 'make', 'host-test', 'ui-host-test')
-    Invoke-Checked docker @('run', '--rm', '--network', 'none', '-v', $mount, '-w', '/app', $builderId, 'make', '-j2', "UIF_COMPONENT_VERSION=$Version", "UIF_COMPONENT_BUILD_ID=$buildId")
+    $mount = "${source}:/src"
+    Invoke-Checked docker @('run', '--rm', '--network', 'none', '-v', $mount, '-w', '/src', $testerId, 'make', 'host-test', 'ui-host-test')
+    Invoke-Checked docker @('run', '--rm', '--network', 'none', '-v', $mount, '-w', '/src', $builderId, 'make', '-j2', "UIF_COMPONENT_VERSION=$Version", "UIF_COMPONENT_BUILD_ID=$buildId")
+
+    if ((Assert-UifNativeSourceMapping -ProjectRoot $source) -cne $sourceFingerprint) { throw 'Native source changed during tests or compilation.' }
 
     $stem = 'uinjectforge-assistant'
     $rpx = Join-Path $source "$stem.rpx"
@@ -68,6 +75,8 @@ try {
     $provenance = [ordered]@{
         component = 'UInjectForge Assistant'; version = $Version; buildId = $buildId
         sourceCommit = $commit; sourceUrl = "https://github.com/ZestyTS/UInjectForge-Assistant/tree/$commit"
+        nativeSourceFingerprint = $sourceFingerprint; upstreamSourceCommit = $sourceMap.upstreamCommit
+        sourceArchive = $sourceArchiveName
         capturedUtc = [DateTimeOffset]::UtcNow.ToString('O')
         sourceArchiveSha256 = (Get-FileHash -LiteralPath $sourceArchive -Algorithm SHA256).Hash
         dockerfile = [IO.File]::ReadAllText((Join-Path $source 'Dockerfile'))
@@ -100,7 +109,8 @@ try {
         }
     } finally { $archive.Dispose() }
     $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
-    [IO.File]::WriteAllText((Join-Path $output 'SHA256SUMS.txt'), "$zipHash  $zipName`n")
+    $sourceHash = (Get-FileHash -LiteralPath $sourceArchive -Algorithm SHA256).Hash
+    [IO.File]::WriteAllText((Join-Path $output 'SHA256SUMS.txt'), "$zipHash  $zipName`n$sourceHash  $sourceArchiveName`n")
     Write-Host "Verified package: $zip"
     Write-Host "Source: $commit; build ID: $buildId; SHA-256: $zipHash"
     Write-Host 'No upload performed. Exact-package Wii U hardware acceptance remains pending.'

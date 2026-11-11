@@ -9,6 +9,15 @@ HOSTCXX ?= c++
 HOST_TEST_BUILD := build-host
 HOST_TEST_ONLY := $(if $(filter host-test ui-host-test,$(MAKECMDGOALS)),$(if $(filter-out host-test ui-host-test clean,$(MAKECMDGOALS)),,yes),)
 
+# Host-only Darwin builds need the POSIX-backed malloc.h adapter. CPATH is
+# inherited by both direct host recipes and their shell test runners; it is
+# scoped to this make process and is never added to Wii U production builds.
+ifeq ($(HOST_TEST_ONLY),yes)
+ifeq ($(shell uname -s),Darwin)
+export CPATH := $(abspath tests/host-darwin)$(if $(strip $(CPATH)),:$(CPATH))
+endif
+endif
+
 TOPDIR ?= $(CURDIR)
 
 # wut_rules snapshots these values when it is included, so keep them above the
@@ -16,7 +25,7 @@ TOPDIR ?= $(CURDIR)
 APP_NAME := UInjectForge Assistant
 APP_SHORTNAME := UIF Assistant
 APP_AUTHOR := ZestyTS
-UIF_COMPONENT_VERSION ?= 1.0.0-preview.20260921
+UIF_COMPONENT_VERSION ?= 1.0.0-alpha
 UIF_COMPONENT_BUILD_ID ?= dev
 
 ifneq ($(HOST_TEST_ONLY),yes)
@@ -44,26 +53,54 @@ CFLAGS += $(INCLUDE) -D__WIIU__ -D__WUT__ \
 CXXFLAGS := $(CFLAGS) -std=gnu++17
 ASFLAGS := -g $(ARCH)
 LDFLAGS = -g $(ARCH) $(RPXSPECS) -Wl,-Map,$(notdir $*.map)
-LIBS := -lSDL2 -lSDL2_ttf -lfreetype -lpng -lbz2 -lz -lmbedcrypto -lwut
-LIBDIRS := $(PORTLIBS) $(WUT_ROOT) $(WUT_ROOT)/usr
+LIBS := -lSDL2 -lSDL2_ttf -lfreetype -lpng -lbz2 -lz -lmbedcrypto -lmocha -lwut
+LIBDIRS := $(TOPDIR)/build/mocha $(PORTLIBS) $(WUT_ROOT) $(WUT_ROOT)/usr
 .PHONY: host-test ui-host-test
 ui-host-test:
 	@mkdir -p $(HOST_TEST_BUILD)
-	@$(HOSTCC) -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -Iinclude -c source/assistant_policy.c -o $(HOST_TEST_BUILD)/assistant-policy.o
-	@$(HOSTCC) -std=c11 -Wall -Wextra -Werror -DUIF_ASSISTANT_HOST_TEST -Iinclude -Itests -c source/assistant_storage.c -o $(HOST_TEST_BUILD)/assistant-storage.o
-	@$(HOSTCXX) -std=c++17 -Wall -Wextra -Werror -DUIF_ASSISTANT_HOST_TEST -Iinclude -Itests $$(pkg-config --cflags sdl2 SDL2_ttf) tests/assistant_ui_tests.cpp $(HOST_TEST_BUILD)/assistant-storage.o $(HOST_TEST_BUILD)/assistant-policy.o -lmbedcrypto $$(pkg-config --libs sdl2 SDL2_ttf) -o $(HOST_TEST_BUILD)/assistant-ui-tests
+	@$(HOSTCC) -UNDEBUG -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -Iinclude -c source/assistant_policy.c -o $(HOST_TEST_BUILD)/assistant-policy.o
+	@$(HOSTCC) -UNDEBUG -std=c11 -Wall -Wextra -Werror -DUIF_ASSISTANT_HOST_TEST -Iinclude -Itests -c source/assistant_storage.c -o $(HOST_TEST_BUILD)/assistant-storage.o
+	@$(HOSTCC) -UNDEBUG -std=c11 -Wall -Wextra -Werror -Iinclude -c source/assistant_settings.c -o $(HOST_TEST_BUILD)/assistant-settings.o
+	@$(HOSTCC) -UNDEBUG -std=c11 -Wall -Wextra -Werror -Iinclude -c source/assistant_json.c -o $(HOST_TEST_BUILD)/assistant-json.o
+	@$(HOSTCXX) -UNDEBUG -std=c++17 -Wall -Wextra -Werror -DUIF_ASSISTANT_HOST_TEST -Iinclude -Itests $$(pkg-config --cflags sdl2 SDL2_ttf) tests/assistant_ui_tests.cpp $(HOST_TEST_BUILD)/assistant-storage.o $(HOST_TEST_BUILD)/assistant-policy.o $(HOST_TEST_BUILD)/assistant-settings.o $(HOST_TEST_BUILD)/assistant-json.o -lmbedcrypto $$(pkg-config --libs sdl2 SDL2_ttf) -o $(HOST_TEST_BUILD)/assistant-ui-tests
 	@SDL_VIDEODRIVER=dummy $(HOST_TEST_BUILD)/assistant-ui-tests $(HOST_TEST_BUILD)/screenshots
 
 host-test:
 	@mkdir -p $(HOST_TEST_BUILD)
+	@sh tests/run-mocha-lifecycle.sh
+	@$(HOSTCC) -UNDEBUG -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -fsanitize=address,undefined -DUIF_ASSISTANT_HOST_TEST -Iinclude -Itests source/assistant_title_folders.c tests/assistant_title_folders_tests.c -o $(HOST_TEST_BUILD)/assistant-title-folders-tests
+	@$(HOST_TEST_BUILD)/assistant-title-folders-tests
+	@$(HOSTCC) -UNDEBUG -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -DUIF_ASSISTANT_HOST_TEST -Iinclude -Itests source/assistant_catalog_probe.c tests/assistant_catalog_probe_tests.c -o $(HOST_TEST_BUILD)/assistant-catalog-probe-tests
+	@$(HOST_TEST_BUILD)/assistant-catalog-probe-tests
+	@sh tests/run-catalog-probe-handler.sh
+	@$(HOSTCC) -UNDEBUG -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude source/assistant_power.c tests/assistant_power_tests.c -o $(HOST_TEST_BUILD)/assistant-power-tests
+	@$(HOST_TEST_BUILD)/assistant-power-tests
+	@sh tests/run-power-wiring.sh
+	@$(HOSTCC) -UNDEBUG -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude source/assistant_upload.c tests/assistant_upload_schedule_tests.c -o $(HOST_TEST_BUILD)/assistant-upload-schedule-tests
+	@$(HOST_TEST_BUILD)/assistant-upload-schedule-tests
+	@sh tests/run-upload-owner-wiring.sh
+	@sh tests/run-upload-receiver.sh
+	@sh tests/run-ftp.sh
+	@sh tests/run-ftp-socket-tuning.sh
+	@sh tests/run-ftp-integration.sh
+	@$(HOSTCC) -UNDEBUG -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude source/assistant_settings.c source/assistant_json.c tests/assistant_settings_tests.c -o $(HOST_TEST_BUILD)/assistant-settings-tests
+	@$(HOST_TEST_BUILD)/assistant-settings-tests
+	@sh tests/run-settings-state.sh
+	@sh tests/run-telemetry-paths.sh
+	@$(HOSTCC) -UNDEBUG -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude source/assistant_pairing.c tests/assistant_pairing_tests.c -lmbedcrypto -o $(HOST_TEST_BUILD)/assistant-pairing-tests
+	@$(HOST_TEST_BUILD)/assistant-pairing-tests
 	@sh tests/run-transfer-results.sh $(UIF_RESULT_FIXTURE)
-	@$(HOSTCC) -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude source/assistant_policy.c tests/assistant_policy_tests.c -lmbedcrypto -o $(HOST_TEST_BUILD)/assistant-policy-tests
+	@$(HOSTCC) -UNDEBUG -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude source/assistant_policy.c tests/assistant_policy_tests.c -lmbedcrypto -o $(HOST_TEST_BUILD)/assistant-policy-tests
 	@$(HOST_TEST_BUILD)/assistant-policy-tests
-	@$(HOSTCC) -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude source/assistant_json.c source/assistant_paths.c tests/assistant_json_tests.c -o $(HOST_TEST_BUILD)/assistant-json-tests
+	@$(HOSTCC) -UNDEBUG -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude source/assistant_staged_install.c source/assistant_json.c source/assistant_policy.c tests/assistant_staged_install_tests.c -lmbedcrypto -o $(HOST_TEST_BUILD)/assistant-staged-install-tests
+	@$(HOST_TEST_BUILD)/assistant-staged-install-tests
+	@sh tests/run-staged-install-handler.sh
+	@sh tests/run-install-context-wiring.sh
+	@$(HOSTCC) -UNDEBUG -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude source/assistant_json.c source/assistant_paths.c tests/assistant_json_tests.c -o $(HOST_TEST_BUILD)/assistant-json-tests
 	@$(HOST_TEST_BUILD)/assistant-json-tests $(UIF_WIRE_FIXTURE)
-	@$(HOSTCC) -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude source/assistant_install.c source/assistant_security.c tests/assistant_install_tests.c -o $(HOST_TEST_BUILD)/assistant-install-tests
+	@$(HOSTCC) -UNDEBUG -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude source/assistant_install.c source/assistant_security.c tests/assistant_install_tests.c -o $(HOST_TEST_BUILD)/assistant-install-tests
 	@$(HOST_TEST_BUILD)/assistant-install-tests
-	@$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iinclude source/assistant_security.c source/assistant_paths.c tests/assistant_security_tests.c -o $(HOST_TEST_BUILD)/assistant-security-tests
+	@$(HOSTCC) -UNDEBUG -std=c11 -Wall -Wextra -Werror -Iinclude source/assistant_security.c source/assistant_paths.c tests/assistant_security_tests.c -o $(HOST_TEST_BUILD)/assistant-security-tests
 	@$(HOST_TEST_BUILD)/assistant-security-tests
 
 ifneq ($(BUILD),$(notdir $(CURDIR)))
@@ -110,11 +147,16 @@ ifneq (,$(strip $(DRC_SPLASH)))
 export APP_DRC_SPLASH := $(TOPDIR)/$(DRC_SPLASH)
 endif
 
-.PHONY: $(BUILD) clean all
+.PHONY: $(BUILD) mocha clean all
 
 all: $(BUILD)
 
-$(BUILD):
+mocha:
+	@mkdir -p $(BUILD)/mocha
+	@cp -R source/libmocha/source source/libmocha/include source/libmocha/Makefile $(BUILD)/mocha/
+	@$(MAKE) --no-print-directory -C $(BUILD)/mocha
+
+$(BUILD): mocha
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 

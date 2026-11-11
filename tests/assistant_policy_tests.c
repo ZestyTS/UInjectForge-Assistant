@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "assistant_test_temp.h"
 #include "assistant_policy.h"
 #include <assert.h>
 #include <stdio.h>
@@ -8,9 +9,9 @@
 #include <sys/stat.h>
 int main(void)
 {
-    char root[] = "/tmp/uif-policy-XXXXXX";
-    assert(mkdtemp(root));
-    char path[1024], renamed[512];
+    char root[ASSISTANT_TEST_TEMP_ROOT_CAPACITY];
+    assert(assistant_test_make_temp_directory(root, sizeof(root), "uif-policy"));
+    char path[2048], renamed[1024];
     snprintf(path, sizeof(path), "%s/title.tmd", root);
     FILE *file = fopen(path, "wb"); assert(file); fputs("tmd-A", file); fclose(file);
     assert(assistant_policy_read(root) == ASSISTANT_POLICY_UNKNOWN);

@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
+#include <coreinit/im.h>
 #include <coreinit/ios.h>
 #include <coreinit/mcp.h>
 #include <coreinit/memdefaultheap.h>
@@ -43,9 +44,16 @@
 #include "assistant_json.h"
 #include "assistant_policy.h"
 #include "assistant_security.h"
+#include "assistant_pairing.h"
 #include "assistant_install.h"
 #include "assistant_telemetry.h"
 #include "assistant_storage.h"
+#include "assistant_catalog_probe.h"
+#include "assistant_title_folders.h"
+#include "assistant_staged_install.h"
+#include "assistant_power.h"
+#include "assistant_upload.h"
+#include "assistant_ftp.h"
 
 #define UIF_ASSISTANT_PROTOCOL "uif-assistant-transfer-v1"
 #ifndef UIF_COMPONENT_VERSION
@@ -54,14 +62,15 @@
 #ifndef UIF_COMPONENT_BUILD_ID
 #define UIF_COMPONENT_BUILD_ID "dev"
 #endif
-#define UIF_ASSISTANT_CAPABILITIES_JSON "[\"pairing\",\"transfer-v1\",\"manual-install\",\"auto-install\",\"installed-titles\",\"console-events\",\"title-launch\",\"setup-check\",\"overlapped-upload-install\",\"transfer-results-by-id\"]"
+#define UIF_ASSISTANT_CAPABILITIES_JSON "[\"pairing\",\"remembered-pairing-v1\",\"transfer-v1\",\"manual-install\",\"auto-install\",\"installed-titles\",\"console-events\",\"title-launch\",\"setup-check\",\"overlapped-upload-install\",\"transfer-results-by-id\",\"install-existing-usb-v1\",\"ftp-bulk-v1\"]"
 #define UIF_ASSISTANT_PORT 8573
 #define UIF_MAX_FILES 768
 #define UIF_MAX_PATH 768
 #define UIF_MAX_TEXT 256
 #define UIF_MAX_HEADER 65536
 #define UIF_MAX_MANIFEST (1024 * 1024)
-#define UIF_IO_BUFFER 32768
+#define UIF_IO_BUFFER (256U * 1024U)
+#define UIF_UPLOAD_BUFFER (256U * 1024U)
 #define UIF_LOG_TAIL_BYTES 16384
 #define UIF_ACTIVITY_LINES 8
 #define UIF_MAX_SETUP_PACKAGES 512
@@ -117,6 +126,8 @@ typedef struct
 {
     bool active;
     bool manifest_loaded;
+    bool ftp_bulk;
+    bool ftp_sealed;
     char transfer_id[64];
     char package_display_name[UIF_MAX_TEXT];
     char package_kind[64];
@@ -169,7 +180,9 @@ typedef struct
 typedef struct
 {
     unsigned int pairing_code;
+    bool pairing_code_persisted;
     char access_token[96];
+    AssistantPairingTrust pairing_trust;
     bool paired;
     char sd_root[UIF_MAX_PATH];
     char ip_address[64];
@@ -182,6 +195,12 @@ typedef struct
     bool manual_install_enabled;
     bool auto_install_enabled;
     float ui_scale;
+    AssistantSettings settings;
+    AssistantSettings network_settings;
+    bool settings_restart_required;
+    bool settings_save_ok;
+    unsigned int settings_revision;
+    char settings_message[UIF_MAX_TEXT];
     int broadcast_port;
     int server_fd;
     int broadcast_fd;
@@ -202,6 +221,15 @@ typedef struct
     char activity_log[UIF_ACTIVITY_LINES][UIF_MAX_TEXT];
     unsigned int activity_count;
     AssistantTransfer transfer;
+    struct AssistantFtpServer *ftp_server;
+    FILE *ftp_file;
+    unsigned char *ftp_stdio_buffer;
+    AssistantFile *ftp_entry;
+    long long ftp_written;
+    uint64_t ftp_write_ticks;
+    uint64_t ftp_owner_service_ticks, ftp_redraw_ticks;
+    unsigned int ftp_owner_service_calls, ftp_redraw_calls;
+    uint64_t ftp_sleep_ticks, ftp_select_ticks, ftp_sleep_calls, ftp_select_calls;
     AssistantTransferResult last_transfer_result;
     AssistantTransferResult pending_install_result;
     AssistantTransferResult recent_results[8];
@@ -210,6 +238,10 @@ typedef struct
     char receiving_file_path[UIF_MAX_PATH];
     long long receiving_file_bytes;
     long long receiving_file_total_bytes;
+    bool verifying_files;
+    long long verified_bytes;
+    uint64_t file_started_ticks;
+    uint64_t file_last_activity_ticks;
     bool auto_install_pending;
     bool install_active;
     long long install_done_bytes;
@@ -232,12 +264,45 @@ typedef struct {
     IOSVec *path_vector;
     char *install_path;
     uint32_t *callback_context;
+    AssistantTitleFolderSession folder_session;
     uint64_t observed_title_id, last_render_ms;
     char event_id[64], failure[UIF_MAX_TEXT];
 } AssistantInstallContext;
 static AssistantInstallContext g_install;
+static AssistantStagedInstallRequest g_staged_install;
+static AssistantPowerGuard g_power_guard;
 static void tick_install(AssistantState *state);
 static void service_install_status_request(AssistantState *state);
+static void stop_ftp_transfer(AssistantState *state);
+
+static int read_runtime_apd(void *context, uint32_t *enabled)
+{
+    (void)context;
+    return IM_GetRuntimeParameter(IM_PARAMETER_APD_ENABLED, enabled);
+}
+
+static int write_runtime_apd(void *context, uint32_t enabled)
+{
+    (void)context;
+    return IM_SetRuntimeParameter(IM_PARAMETER_APD_ENABLED, enabled);
+}
+
+static void update_power_guard(const AssistantState *state, bool exiting)
+{
+    static const AssistantPowerIo io = {read_runtime_apd, write_runtime_apd};
+    bool busy = !exiting && (state->transfer.active || state->receiving_file
+        || state->install_active || state->auto_install_pending);
+    AssistantPowerResult result = assistant_power_update(&g_power_guard, busy,
+        exiting ? UINT64_MAX : OSTicksToMilliseconds(OSGetTime()), &io, NULL);
+    if (result == ASSISTANT_POWER_SUSPENDED)
+        WHBLogPrintf("Automatic power-down paused while Assistant is busy.");
+    else if (result == ASSISTANT_POWER_RESTORED)
+        WHBLogPrintf("Previous runtime automatic-power-down setting restored.");
+    else if (result == ASSISTANT_POWER_READ_FAILED || result == ASSISTANT_POWER_DISABLE_FAILED)
+        WHBLogPrintf("Cannot pause automatic power-down. Disable it in System Settings for long transfers.");
+    else if (result == ASSISTANT_POWER_RESTORE_FAILED)
+        WHBLogPrintf("Could not restore runtime automatic power-down; retrying while idle.");
+}
 
 static void store_transfer_result(AssistantState *state, const AssistantTransferResult *result)
 {
@@ -698,8 +763,15 @@ static void render_assistant_screen(const AssistantState *state)
     model.install_enabled = state->install_enabled;
     model.manual_install_enabled = state->manual_install_enabled;
     model.auto_install_enabled = state->auto_install_enabled;
+    model.trusted_device_count = state->pairing_trust.count;
     model.ui_scale = state->ui_scale;
     model.install_active = state->install_active;
+    model.settings = state->settings;
+    model.settings_busy = state->transfer.active || state->auto_install_pending || state->install_active;
+    model.settings_restart_required = state->settings_restart_required;
+    model.settings_save_ok = state->settings_save_ok;
+    model.settings_revision = state->settings_revision;
+    copy_text(model.settings_message, sizeof(model.settings_message), state->settings_message);
     model.install_done_bytes = state->install_done_bytes;
     model.install_total_bytes = state->install_total_bytes;
     model.sd_space_known = get_cached_sd_space(state, &model.sd_free_bytes, &model.sd_total_bytes);
@@ -729,6 +801,7 @@ static void render_assistant_screen(const AssistantState *state)
     }
 
     model.pairing_code = state->pairing_code;
+    model.pairing_code_persisted = state->pairing_code_persisted;
     model.http_request_count = state->http_request_count;
     model.http_error_count = state->http_error_count;
     model.pairing_attempt_count = state->pairing_attempt_count;
@@ -755,6 +828,18 @@ static void render_assistant_screen(const AssistantState *state)
     model.total_bytes = state->transfer.total_bytes;
     model.uploaded_bytes = state->transfer.uploaded_bytes
         + (state->receiving_file ? state->receiving_file_bytes : 0);
+    model.current_file_active = state->receiving_file || state->verifying_files;
+    model.verifying_files = state->verifying_files;
+    copy_text(model.current_file_path, sizeof(model.current_file_path), state->receiving_file_path);
+    model.current_file_bytes = state->receiving_file_bytes;
+    model.current_file_total_bytes = state->receiving_file_total_bytes;
+    model.verified_bytes = state->verified_bytes + (state->verifying_files ? state->receiving_file_bytes : 0);
+    if (model.current_file_active) {
+        uint64_t now = OSGetTime();
+        uint64_t elapsed = OSTicksToMilliseconds(now - state->file_started_ticks);
+        model.current_file_bytes_per_second = elapsed > 0 ? state->receiving_file_bytes * 1000.0 / elapsed : 0;
+        model.current_file_idle_seconds = (unsigned int)(OSTicksToMilliseconds(now - state->file_last_activity_ticks) / 1000);
+    }
     model.last_transfer_has_result = state->last_transfer_result.has_result;
     model.last_transfer_success = state->last_transfer_result.success;
     model.last_transfer_canceled = state->last_transfer_result.canceled;
@@ -1504,7 +1589,7 @@ static void digest_to_hex(const unsigned char digest[32], char output[65])
     output[64] = '\0';
 }
 
-static bool hash_file_sha256(const char *path, char output[65], long long *size_bytes)
+static bool hash_file_sha256(const char *path, char output[65], long long *size_bytes, AssistantState *state)
 {
     if (size_bytes)
         *size_bytes = 0;
@@ -1532,8 +1617,14 @@ static bool hash_file_sha256(const char *path, char output[65], long long *size_
 
     bool success = true;
     long long total = 0;
+    uint64_t last_render = 0;
+    AssistantUploadPump pump = {0};
     for (;;)
     {
+        if (state && g_procui_exit_requested) {
+            success = false;
+            break;
+        }
         size_t read = fread(buffer, 1, UIF_IO_BUFFER, file);
         if (read > 0)
         {
@@ -1543,6 +1634,25 @@ static bool hash_file_sha256(const char *path, char output[65], long long *size_
                 break;
             }
             total += (long long)read;
+        }
+
+        if (state) {
+            uint64_t now = OSGetTime();
+            state->receiving_file_bytes = total;
+            if (read > 0) state->file_last_activity_ticks = now;
+            if (assistant_upload_control_due(&pump, OSTicksToMilliseconds(now))) {
+                if (!WHBProcIsRunning()) { success = false; break; }
+                assistant_ui_poll_input();
+                if (state->verifying_files) {
+                    tick_install(state);
+                    service_install_status_request(state);
+                }
+                assistant_upload_control_complete(&pump, OSTicksToMilliseconds(OSGetTime()));
+            }
+            if (now - last_render >= OSMillisecondsToTicks(UIF_UPLOAD_RENDER_INTERVAL_MS)) {
+                render_assistant_screen(state);
+                last_render = OSGetTime();
+            }
         }
 
         if (read < UIF_IO_BUFFER)
@@ -1928,174 +2038,81 @@ static bool extract_pairing_code_from_body(const char *body, char *output, size_
     return normalize_pairing_code(body, output, output_size);
 }
 
+static void apply_live_settings(AssistantState *state)
+{
+    const AssistantSettings *s = &state->settings;
+    state->simple_ui = s->simple_ui;
+    state->install_enabled = s->install_enabled;
+    state->manual_install_enabled = s->install_enabled && s->manual_install_enabled;
+    state->auto_install_enabled = s->install_enabled && s->auto_install_enabled;
+    state->ui_scale = s->allow_ui_scale ? s->ui_scale_percent / 100.0f : UIF_ASSISTANT_DEFAULT_UI_SCALE;
+}
+
 static void load_assistant_config(AssistantState *state)
 {
-    state->http_port = UIF_ASSISTANT_PORT;
-    state->broadcast_enabled = true;
-    state->passive_broadcast_enabled = false;
-    state->simple_ui = true;
-    state->install_enabled = true;
-    state->manual_install_enabled = true;
-    state->auto_install_enabled = false;
-    state->ui_scale = UIF_ASSISTANT_DEFAULT_UI_SCALE;
-    state->broadcast_port = UIF_ASSISTANT_PORT;
-
-    char config_path[UIF_MAX_PATH];
-    join_path(config_path, sizeof(config_path), state->sd_root, "wiiu/apps/uinjectforge-assistant/config.json");
-
-    FILE *file = fopen(config_path, "rb");
-    if (!file)
-        return;
-
-    char json[8192];
-    size_t read = fread(json, 1, sizeof(json) - 1, file);
-    fclose(file);
-    json[read] = '\0';
-
-    long long port = 0;
-    if (json_get_long(json, "httpPort", &port) && port >= 1 && port <= 65535)
-        state->http_port = (int)port;
-
-    long long broadcast_port = 0;
-    if (json_get_long(json, "broadcastPort", &broadcast_port) && broadcast_port >= 1 && broadcast_port <= 65535)
-        state->broadcast_port = (int)broadcast_port;
-    else
-        state->broadcast_port = state->http_port;
-
-    bool broadcast_enabled = true;
-    if (json_get_bool(json, "broadcastEnabled", &broadcast_enabled))
-        state->broadcast_enabled = broadcast_enabled;
-
-    bool passive_broadcast_enabled = false;
-    if (json_get_bool(json, "passiveBroadcastEnabled", &passive_broadcast_enabled))
-        state->passive_broadcast_enabled = passive_broadcast_enabled;
-
-    bool simple_ui = state->simple_ui;
-    if (json_get_bool(json, "simpleUi", &simple_ui))
-        state->simple_ui = simple_ui;
-
-    bool install_enabled = true;
-    bool manual_install_enabled = true;
-    bool auto_install_enabled = false;
-    bool has_install_enabled = json_get_bool(json, "installEnabled", &install_enabled);
-    bool has_manual_install_enabled = json_get_bool(json, "manualInstallEnabled", &manual_install_enabled);
-    bool has_auto_install_enabled = json_get_bool(json, "autoInstallEnabled", &auto_install_enabled);
-    AssistantInstallPermissions install_permissions = assistant_resolve_install_permissions(
-        has_install_enabled,
-        install_enabled,
-        has_manual_install_enabled,
-        manual_install_enabled,
-        has_auto_install_enabled,
-        auto_install_enabled);
-    state->install_enabled = install_permissions.global_enabled;
-    state->manual_install_enabled = install_permissions.manual_enabled;
-    state->auto_install_enabled = install_permissions.automatic_enabled;
-
-    char ui_mode[64];
-    if (json_get_string(json, "uiMode", ui_mode, sizeof(ui_mode)))
-    {
-        if (equals_ignore_case(ui_mode, "simple") || equals_ignore_case(ui_mode, "fallback"))
-        {
-            state->simple_ui = true;
-        }
-        else if (equals_ignore_case(ui_mode, "full") || equals_ignore_case(ui_mode, "dashboard") || equals_ignore_case(ui_mode, "advanced"))
-        {
-            state->simple_ui = false;
-        }
+    state->settings = assistant_settings_defaults();
+    if (!assistant_settings_load(state->sd_root, &state->settings, state->settings_message, sizeof(state->settings_message))) {
+        state->settings.install_enabled = false;
+        state->settings.manual_install_enabled = false;
+        state->settings.auto_install_enabled = false;
     }
-
+    state->network_settings = state->settings;
+    state->http_port = state->settings.http_port;
+    state->broadcast_port = state->settings.broadcast_port;
+    state->broadcast_enabled = state->settings.broadcast_enabled;
+    state->passive_broadcast_enabled = state->settings.passive_broadcast_enabled;
+    apply_live_settings(state);
 }
 
 static void load_assistant_preferences(AssistantState *state)
 {
-    char preferences_path[UIF_MAX_PATH];
-    if (!join_path_checked(
-            preferences_path,
-            sizeof(preferences_path),
-            state->sd_root,
-            "uinjectforge/assistant/preferences.json"))
-        return;
-
-    FILE *file = fopen(preferences_path, "rb");
-    if (!file)
-        return;
-
-    char json[1024];
-    size_t read = fread(json, 1, sizeof(json) - 1, file);
+    /* Older UI versions saved only this preference. First successful settings
+       save migrates it into config.json and marks the old overlay obsolete. */
+    if (state->settings.managed) return;
+    char path[UIF_MAX_PATH], json[1024];
+    if (!join_path_checked(path, sizeof(path), state->sd_root, "uinjectforge/assistant/preferences.json")) return;
+    FILE *file = fopen(path, "rb");
+    if (!file) return;
+    size_t n = fread(json, 1, sizeof(json) - 1, file);
+    bool ok = !ferror(file) && fgetc(file) == EOF;
     fclose(file);
-    json[read] = '\0';
-
-    bool auto_install_enabled = state->auto_install_enabled;
-    if (json_get_bool(json, "autoInstallEnabled", &auto_install_enabled))
-        state->auto_install_enabled = state->install_enabled && auto_install_enabled;
+    json[n] = 0;
+    bool enabled;
+    if (ok && json_get_bool(json, "autoInstallEnabled", &enabled)) {
+        state->settings.auto_install_enabled = enabled;
+        apply_live_settings(state);
+    }
 }
 
-static bool save_assistant_preferences(const AssistantState *state, char *error, size_t error_size)
+static bool load_persistent_pairing_code(AssistantState *state)
 {
-    char preferences_root[UIF_MAX_PATH];
-    char preferences_path[UIF_MAX_PATH];
-    char temporary_path[UIF_MAX_PATH];
-    char backup_path[UIF_MAX_PATH];
-    if (!join_path_checked(preferences_root, sizeof(preferences_root), state->sd_root, "uinjectforge/assistant")
-        || !join_path_checked(preferences_path, sizeof(preferences_path), preferences_root, "preferences.json")
-        || !join_path_checked(temporary_path, sizeof(temporary_path), preferences_root, "preferences.json.tmp")
-        || !join_path_checked(backup_path, sizeof(backup_path), preferences_root, "preferences.json.bak"))
-    {
-        snprintf(error, error_size, "Assistant preferences path is too long.");
+    state->pairing_code_persisted = assistant_settings_pairing_code(state->sd_root, &state->settings,
+        create_pairing_code(state), &state->pairing_code, state->settings_message, sizeof(state->settings_message));
+    if (!state->pairing_code_persisted) {
+        set_status(state, state->settings_message);
         return false;
     }
-
-    if (!mkdir_recursive(preferences_root))
-    {
-        snprintf(error, error_size, "Assistant could not create its preferences folder on SD.");
-        return false;
-    }
-
-    unlink(temporary_path);
-    unlink(backup_path);
-    FILE *file = fopen(temporary_path, "wb");
-    if (!file)
-    {
-        snprintf(error, error_size, "Assistant could not open its temporary preferences file.");
-        return false;
-    }
-
-    int written = fprintf(
-        file,
-        "{\n"
-        "  \"schemaVersion\": 1,\n"
-        "  \"autoInstallEnabled\": %s\n"
-        "}\n",
-        state->auto_install_enabled ? "true" : "false");
-    bool write_succeeded = written > 0 && fflush(file) == 0;
-    if (fclose(file) != 0)
-        write_succeeded = false;
-    if (!write_succeeded)
-    {
-        unlink(temporary_path);
-        snprintf(error, error_size, "Assistant could not finish writing its preferences file.");
-        return false;
-    }
-
-    bool had_existing_preferences = path_exists(preferences_path);
-    if (had_existing_preferences && rename(preferences_path, backup_path) != 0)
-    {
-        unlink(temporary_path);
-        snprintf(error, error_size, "Assistant could not preserve its existing preferences.");
-        return false;
-    }
-
-    if (rename(temporary_path, preferences_path) != 0)
-    {
-        if (had_existing_preferences)
-            rename(backup_path, preferences_path);
-        unlink(temporary_path);
-        snprintf(error, error_size, "Assistant could not publish its updated preferences.");
-        return false;
-    }
-
-    unlink(backup_path);
+    state->settings.managed = true;
     return true;
+}
+
+static bool save_ui_settings(AssistantState *state, const AssistantSettings *settings)
+{
+    state->settings_revision++;
+    state->settings_save_ok = false;
+    if (state->transfer.active || state->auto_install_pending || state->install_active)
+        copy_text(state->settings_message, sizeof(state->settings_message), "Finish the transfer or installation before saving settings.");
+    else if (assistant_settings_save(state->sd_root, settings, state->settings_message, sizeof(state->settings_message))) {
+        state->settings = *settings;
+        state->settings.managed = true;
+        state->settings_restart_required = assistant_settings_network_changed(&state->network_settings, settings);
+        state->settings_save_ok = true;
+        apply_live_settings(state);
+        copy_text(state->settings_message, sizeof(state->settings_message), state->settings_restart_required
+            ? "Saved. Restart Assistant to apply network settings." : "Settings saved.");
+    }
+    set_status(state, state->settings_message);
+    return state->settings_save_ok;
 }
 
 static const char *find_matching_brace(const char *start)
@@ -2148,6 +2165,15 @@ static bool parse_manifest(AssistantState *state, const char *json, char *error,
 {
     static AssistantTransfer transfer;
     memset(&transfer, 0, sizeof(transfer));
+
+    char bulk_transport[16];
+    if (json_get_string(json, "bulkTransport", bulk_transport, sizeof(bulk_transport))) {
+        if (strcmp(bulk_transport, "ftp") != 0 && strcmp(bulk_transport, "http") != 0) {
+            snprintf(error, error_size, "Unsupported bulk transport.");
+            return false;
+        }
+        transfer.ftp_bulk = strcmp(bulk_transport, "ftp") == 0;
+    }
 
     char protocol[UIF_MAX_TEXT];
     if (!json_get_string(json, "protocolVersion", protocol, sizeof(protocol)) || strcmp(protocol, UIF_ASSISTANT_PROTOCOL) != 0)
@@ -2364,20 +2390,81 @@ static bool parse_manifest(AssistantState *state, const char *json, char *error,
     }
 
     state->transfer = transfer;
+    update_power_guard(state, false);
     return true;
+}
+
+static const char *authorization_token(const HttpRequest *request)
+{
+    const char *prefix = "Bearer ";
+    if (!starts_with_ignore_case(request->authorization, prefix))
+        return NULL;
+    return skip_spaces(request->authorization + strlen(prefix));
 }
 
 static bool authorization_ok(const AssistantState *state, const HttpRequest *request)
 {
-    if (!state->paired || !state->access_token[0])
-        return false;
+    const char *token = authorization_token(request);
+    return token && ((state->paired && state->access_token[0] && assistant_constant_time_equal(token, state->access_token))
+        || assistant_pairing_contains(&state->pairing_trust, token));
+}
 
-    const char *prefix = "Bearer ";
-    if (!starts_with_ignore_case(request->authorization, prefix))
-        return false;
+static bool save_pairing_trust(AssistantState *state, const AssistantPairingTrust *trust)
+{
+    char root[UIF_MAX_PATH], path[UIF_MAX_PATH];
+    if (!join_path_checked(root, sizeof(root), state->sd_root, "uinjectforge/assistant")
+        || !join_path_checked(path, sizeof(path), root, "paired-devices.bin")
+        || !mkdir_recursive(root) || !assistant_pairing_save(trust, path)) return false;
+    state->pairing_trust = *trust;
+    return true;
+}
 
-    const char *token = skip_spaces(request->authorization + strlen(prefix));
-    return assistant_constant_time_equal(token, state->access_token);
+static void handle_remembered_pairing(int fd, AssistantState *state, const HttpRequest *request)
+{
+    if (!authorization_ok(state, request))
+    {
+        send_message(fd, 401, "Unauthorized", "Pair again using the PIN shown on the console.");
+        return;
+    }
+    if (strcmp(request->method, "GET") == 0)
+    {
+        send_json(fd, 200, "OK", "{\"success\":true,\"message\":\"Pairing is valid.\"}");
+        return;
+    }
+    if (state->transfer.active)
+    {
+        send_message(fd, 409, "Conflict", "Finish or cancel the transfer before changing remembered devices.");
+        return;
+    }
+    const char *token = authorization_token(request);
+    AssistantPairingTrust updated = state->pairing_trust;
+    bool remembering = strcmp(request->method, "POST") == 0;
+    char *remembered_token = NULL;
+    if (remembering && (request->content_length != 32
+        || !read_body_to_memory(fd, request, &remembered_token)))
+    {
+        free(remembered_token);
+        send_message(fd, 400, "Bad Request", "A 32-character random device credential is required.");
+        return;
+    }
+    if (remembering && !assistant_pairing_remember(&updated, remembered_token))
+    {
+        free(remembered_token);
+        send_message(fd, 409, "Conflict", "Cannot remember this device. Forget paired devices on the console if the eight-device limit is reached.");
+        return;
+    }
+    free(remembered_token);
+    if (!remembering) assistant_pairing_forget(&updated, token);
+    if (!save_pairing_trust(state, &updated))
+    {
+        send_message(fd, 500, "Internal Server Error", "Could not save pairing on SD. Existing remembered devices are unchanged.");
+        return;
+    }
+    if (assistant_constant_time_equal(token, state->access_token)) state->access_token[0] = '\0';
+    state->paired = state->access_token[0] || state->pairing_trust.count;
+    send_json(fd, 200, "OK", remembering
+        ? "{\"success\":true,\"message\":\"Device remembered.\"}"
+        : "{\"success\":true,\"message\":\"Device forgotten.\"}");
 }
 
 static void clear_receiving_file_state(AssistantState *state)
@@ -2389,6 +2476,39 @@ static void clear_receiving_file_state(AssistantState *state)
     state->receiving_file_path[0] = '\0';
     state->receiving_file_bytes = 0;
     state->receiving_file_total_bytes = 0;
+    state->verifying_files = false;
+    state->verified_bytes = 0;
+    state->file_started_ticks = 0;
+    state->file_last_activity_ticks = 0;
+}
+
+static bool persist_upload_chunk(FILE *output, mbedtls_sha256_context *sha,
+    const void *data, size_t size, AssistantUploadTiming *timing)
+{
+    uint64_t started = OSGetTime();
+    int result = mbedtls_sha256_update_ret(sha, data, size);
+    timing->hash_ticks += OSGetTime() - started;
+    if (result != 0) return false;
+    started = OSGetTime();
+    bool written = fwrite(data, 1, size, output) == size;
+    timing->write_ticks += OSGetTime() - started;
+    return written;
+}
+
+static void record_upload_timing(AssistantState *state, const AssistantUploadTiming *timing,
+    long long bytes, bool success)
+{
+    char message[UIF_MAX_TEXT];
+    snprintf(message, sizeof(message),
+        "Upload timing: %lld B, %llu ms; recv %llu, SHA %llu, SD %llu, service %llu ms; %u reads/%u pumps (%s).",
+        bytes, (unsigned long long)OSTicksToMilliseconds(timing->total_ticks),
+        (unsigned long long)OSTicksToMilliseconds(timing->receive_ticks),
+        (unsigned long long)OSTicksToMilliseconds(timing->hash_ticks),
+        (unsigned long long)OSTicksToMilliseconds(timing->write_ticks),
+        (unsigned long long)OSTicksToMilliseconds(timing->service_ticks),
+        timing->reads, timing->pumps, success ? "verified" : "failed");
+    append_activity(state, message);
+    WHBLogPrintf("%s", message);
 }
 
 static bool receive_file_body(
@@ -2424,12 +2544,26 @@ static bool receive_file_body(
         return false;
     }
 
+    /* Separate read and stdio buffers coalesce small TCP fragments into bounded
+       SD writes. Keep the stdio half alive until fclose has flushed the tail. */
+    char *buffer = (char *)malloc(2U * UIF_UPLOAD_BUFFER);
+    if (!buffer)
+    {
+        fclose(output);
+        remove(file->staged_path);
+        snprintf(error, error_size, "Out of memory receiving file.");
+        return false;
+    }
+    if (setvbuf(output, buffer + UIF_UPLOAD_BUFFER, _IOFBF, UIF_UPLOAD_BUFFER) != 0)
+        WHBLogPrintf("Upload buffering unavailable; using the default SD buffer.");
+
     mbedtls_sha256_context sha;
     mbedtls_sha256_init(&sha);
     if (mbedtls_sha256_starts_ret(&sha, 0) != 0)
     {
         mbedtls_sha256_free(&sha);
         fclose(output);
+        free(buffer);
         remove(file->staged_path);
         snprintf(error, error_size, "Could not initialize upload verification.");
         return false;
@@ -2437,6 +2571,9 @@ static bool receive_file_body(
 
     long long written = 0;
     bool success = true;
+    AssistantUploadPump pump = {0};
+    AssistantUploadTiming timing = {0};
+    uint64_t upload_started = OSGetTime();
     if (request->body_prefix_len > 0)
     {
         size_t take = request->body_prefix_len;
@@ -2445,8 +2582,7 @@ static bool receive_file_body(
 
         if (take > 0)
         {
-            if (mbedtls_sha256_update_ret(&sha, (const unsigned char *)request->body_prefix, take) != 0
-                || fwrite(request->body_prefix, 1, take, output) != take)
+            if (!persist_upload_chunk(output, &sha, request->body_prefix, take, &timing))
             {
                 snprintf(error, error_size, "Could not persist uploaded file to the SD card.");
                 success = false;
@@ -2455,44 +2591,53 @@ static bool receive_file_body(
         }
     }
 
-    char *buffer = (char *)malloc(UIF_IO_BUFFER);
-    if (!buffer)
-    {
-        mbedtls_sha256_free(&sha);
-        fclose(output);
-        remove(file->staged_path);
-        snprintf(error, error_size, "Out of memory receiving file.");
-        return false;
-    }
-
     state->receiving_file = true;
     copy_text(state->receiving_file_path, sizeof(state->receiving_file_path), file->relative_path);
     state->receiving_file_bytes = written;
     state->receiving_file_total_bytes = request->content_length;
+    state->file_started_ticks = upload_started;
+    state->file_last_activity_ticks = OSGetTime();
     uint64_t last_data_ticks = OSGetTime();
     uint64_t last_render_ticks = 0;
 
     while (success && written < request->content_length)
     {
-        if (g_procui_exit_requested || !WHBProcIsRunning())
+        if (g_procui_exit_requested)
         {
             snprintf(error, error_size, "Upload canceled because Assistant is exiting.");
             success = false;
             break;
         }
 
-        assistant_ui_poll_input();
-        tick_install(state);
-        service_install_status_request(state);
-        handle_discovery_probe(state);
-        send_discovery_broadcast(state);
+        if (assistant_upload_control_due(&pump, OSTicksToMilliseconds(OSGetTime())))
+        {
+            uint64_t service_started = OSGetTime();
+            timing.pumps++;
+            if (!WHBProcIsRunning())
+            {
+                snprintf(error, error_size, "Upload canceled because Assistant is exiting.");
+                success = false;
+                break;
+            }
+            assistant_ui_poll_input();
+            tick_install(state);
+            service_install_status_request(state);
+            handle_discovery_probe(state);
+            send_discovery_broadcast(state);
+            uint64_t service_finished = OSGetTime();
+            timing.service_ticks += service_finished - service_started;
+            /* A slow platform call must not make every next chunk service UI. */
+            assistant_upload_control_complete(&pump, OSTicksToMilliseconds(service_finished));
+        }
 
         fd_set read_set;
         FD_ZERO(&read_set);
         FD_SET(fd, &read_set);
         struct timeval wait_time = {.tv_sec = 0, .tv_usec = 100000};
+        uint64_t receive_started = OSGetTime();
         int ready = select(fd + 1, &read_set, NULL, NULL, &wait_time);
         uint64_t now = OSGetTime();
+        timing.receive_ticks += now - receive_started;
         if (ready < 0)
         {
             if (errno == EINTR)
@@ -2514,8 +2659,11 @@ static bool receive_file_body(
         else
         {
             long long remaining = request->content_length - written;
-            size_t to_read = remaining > UIF_IO_BUFFER ? UIF_IO_BUFFER : (size_t)remaining;
+            size_t to_read = remaining > UIF_UPLOAD_BUFFER ? UIF_UPLOAD_BUFFER : (size_t)remaining;
+            receive_started = OSGetTime();
             ssize_t read_bytes = recv(fd, buffer, to_read, 0);
+            timing.reads++;
+            timing.receive_ticks += OSGetTime() - receive_started;
             if (read_bytes <= 0)
             {
                 snprintf(error, error_size, "Connection closed during file upload.");
@@ -2523,8 +2671,7 @@ static bool receive_file_body(
                 break;
             }
 
-            if (mbedtls_sha256_update_ret(&sha, (const unsigned char *)buffer, (size_t)read_bytes) != 0
-                || fwrite(buffer, 1, (size_t)read_bytes, output) != (size_t)read_bytes)
+            if (!persist_upload_chunk(output, &sha, buffer, (size_t)read_bytes, &timing))
             {
                 snprintf(error, error_size, "Could not persist uploaded file to the SD card.");
                 success = false;
@@ -2534,6 +2681,7 @@ static bool receive_file_body(
             written += read_bytes;
             state->receiving_file_bytes = written;
             last_data_ticks = now;
+            state->file_last_activity_ticks = OSGetTime();
         }
 
         if (now - last_render_ticks >= OSMillisecondsToTicks(UIF_UPLOAD_RENDER_INTERVAL_MS))
@@ -2544,23 +2692,29 @@ static bool receive_file_body(
             char short_path[96];
             copy_display_name(short_path, sizeof(short_path), file->relative_path);
             snprintf(state->status, sizeof(state->status), "Receiving %s: %d%%.", short_path, percent);
+            uint64_t render_started = OSGetTime();
             render_assistant_screen(state);
+            timing.service_ticks += OSGetTime() - render_started;
             last_render_ticks = now;
         }
     }
 
     unsigned char digest[32];
+    uint64_t hash_finish_started = OSGetTime();
     if (success && mbedtls_sha256_finish_ret(&sha, digest) != 0)
     {
         snprintf(error, error_size, "Could not finalize upload verification.");
         success = false;
     }
+    timing.hash_ticks += OSGetTime() - hash_finish_started;
     mbedtls_sha256_free(&sha);
-    free(buffer);
 
+    uint64_t flush_started = OSGetTime();
     bool finalize_failed = fflush(output) != 0 || ferror(output);
     if (fclose(output) != 0)
         finalize_failed = true;
+    timing.write_ticks += OSGetTime() - flush_started;
+    free(buffer);
     if (finalize_failed && success)
     {
         snprintf(error, error_size, "Could not finalize uploaded file on the SD card.");
@@ -2581,6 +2735,8 @@ static bool receive_file_body(
         }
     }
 
+    timing.total_ticks = OSGetTime() - upload_started;
+    record_upload_timing(state, &timing, written, success);
     clear_receiving_file_state(state);
     if (!success)
     {
@@ -2663,21 +2819,41 @@ static bool commit_transfer(AssistantState *state, char *error, size_t error_siz
     if (!validate_transfer_destination_header(transfer, error, error_size))
         return false;
 
+    uint64_t verification_started = OSGetTime();
+    state->verifying_files = true;
+    state->verified_bytes = 0;
     for (int i = 0; i < transfer->file_count; i++)
     {
         AssistantFile *file = &transfer->files[i];
         char actual_sha[65];
         long long actual_size = 0;
+        copy_text(state->receiving_file_path, sizeof(state->receiving_file_path), file->relative_path);
+        state->receiving_file_bytes = 0;
+        state->receiving_file_total_bytes = file->size_bytes;
+        state->file_started_ticks = state->file_last_activity_ticks = OSGetTime();
+        copy_text(state->status, sizeof(state->status), "Verifying files on SD before commit.");
+        render_assistant_screen(state);
         if (!file->uploaded
             || !validate_transfer_file_destination(transfer, file, error, error_size)
-            || !hash_file_sha256(file->staged_path, actual_sha, &actual_size)
+            || !hash_file_sha256(file->staged_path, actual_sha, &actual_size, state)
             || actual_size != file->size_bytes
             || !equals_ignore_case(actual_sha, file->sha256))
         {
+            clear_receiving_file_state(state);
             snprintf(error, error_size, "Staged file verification failed before commit: %s.", file->relative_path);
             return false;
         }
+        state->verified_bytes += actual_size;
     }
+    clear_receiving_file_state(state);
+
+    char verification_timing[UIF_MAX_TEXT];
+    snprintf(verification_timing, sizeof(verification_timing),
+        "Commit verification: %lld B in %llu ms (%d files).", transfer->total_bytes,
+        (unsigned long long)OSTicksToMilliseconds(OSGetTime() - verification_started),
+        transfer->file_count);
+    append_activity(state, verification_timing);
+    WHBLogPrintf("%s", verification_timing);
 
     if (transfer->target_root[0])
     {
@@ -3116,6 +3292,10 @@ static void handle_home(int fd, AssistantState *state)
 
 static void handle_pair(int fd, AssistantState *state, const HttpRequest *request)
 {
+    if (state->transfer.active) {
+        send_message(fd, 409, "Conflict", "Finish or cancel the active transfer before pairing again.");
+        return;
+    }
     uint64_t now = OSGetTime();
     if (state->pairing_retry_after_ticks > now)
     {
@@ -3145,15 +3325,10 @@ static void handle_pair(int fd, AssistantState *state, const HttpRequest *reques
     if (!has_code || !assistant_constant_time_equal(pairing_code, expected))
     {
         state->pairing_failure_count++;
-        state->pairing_failure_streak++;
+        if (state->pairing_failure_streak < 5) state->pairing_failure_streak++;
         unsigned int backoff_ms = assistant_pairing_backoff_ms(state->pairing_failure_streak);
         state->pairing_retry_after_ticks = OSGetTime() + OSMillisecondsToTicks(backoff_ms);
         set_http_error(state, "Pairing failed: the submitted code did not match.");
-        if (state->pairing_failure_streak >= 5)
-        {
-            state->pairing_code = create_pairing_code(state);
-            state->pairing_failure_streak = 0;
-        }
         send_json(fd, 200, "OK", "{\"success\":false,\"message\":\"Pairing code did not match. Recheck the six digits shown on the Wii U screen.\"}");
         return;
     }
@@ -3172,6 +3347,140 @@ static void handle_pair(int fd, AssistantState *state, const HttpRequest *reques
         "{\"success\":true,\"message\":\"Pairing succeeded.\",\"accessToken\":\"%s\"}",
         state->access_token);
     send_json(fd, 200, "OK", json);
+}
+
+/* FTP has no SD namespace of its own. Every write resolves an admitted manifest
+ * entry; no client-supplied path is ever joined directly to the SD root. */
+static bool ftp_begin_file(void *context, const char *relative_path, int64_t *expected_bytes)
+{
+    AssistantState *state = context;
+    if (!state->transfer.active || !state->transfer.ftp_bulk || state->transfer.ftp_sealed
+        || state->ftp_file || state->ftp_entry || !safe_relative_path(relative_path)) return false;
+    AssistantFile *file = find_file(&state->transfer, relative_path);
+    char destination_error[UIF_MAX_TEXT];
+    if (!file || file->uploaded
+        || !validate_transfer_file_destination(&state->transfer, file, destination_error, sizeof(destination_error))
+        || !join_path_checked(file->staged_path, sizeof(file->staged_path), state->transfer.incoming_root, file->target_path)
+        || !ensure_parent_directory(file->staged_path)) return false;
+    state->ftp_stdio_buffer = malloc(UIF_UPLOAD_BUFFER);
+    if (!state->ftp_stdio_buffer) return false;
+    state->ftp_file = fopen(file->staged_path, "wb");
+    if (!state->ftp_file) { free(state->ftp_stdio_buffer); state->ftp_stdio_buffer = NULL; return false; }
+    if (setvbuf(state->ftp_file, (char *)state->ftp_stdio_buffer, _IOFBF, UIF_UPLOAD_BUFFER) != 0) {
+        fclose(state->ftp_file); state->ftp_file = NULL;
+        free(state->ftp_stdio_buffer); state->ftp_stdio_buffer = NULL;
+        remove(file->staged_path); return false;
+    }
+    state->ftp_entry = file;
+    state->ftp_written = 0;
+    state->ftp_write_ticks = 0;
+    state->ftp_owner_service_ticks = state->ftp_redraw_ticks = 0;
+    state->ftp_owner_service_calls = state->ftp_redraw_calls = 0;
+    state->ftp_sleep_ticks = state->ftp_select_ticks = 0;
+    state->ftp_sleep_calls = state->ftp_select_calls = 0;
+    state->receiving_file = true;
+    copy_text(state->receiving_file_path, sizeof(state->receiving_file_path), file->relative_path);
+    state->receiving_file_bytes = 0;
+    state->receiving_file_total_bytes = file->size_bytes;
+    state->file_started_ticks = state->file_last_activity_ticks = OSGetTime();
+    *expected_bytes = file->size_bytes;
+    return true;
+}
+
+static bool ftp_write_file(void *context, const void *bytes, size_t size)
+{
+    AssistantState *state = context;
+    if (!state->ftp_file || !state->ftp_entry || size > (unsigned long long)(state->ftp_entry->size_bytes - state->ftp_written))
+        return false;
+    uint64_t started = OSGetTime();
+    bool ok = fwrite(bytes, 1, size, state->ftp_file) == size;
+    state->ftp_write_ticks += OSGetTime() - started;
+    if (ok) state->ftp_written += (long long)size;
+    return ok;
+}
+
+static void ftp_progress_file(void *context, int64_t bytes)
+{
+    AssistantState *state = context;
+    state->receiving_file_bytes = bytes;
+    state->file_last_activity_ticks = OSGetTime();
+}
+
+static bool ftp_finish_file(void *context, bool complete)
+{
+    AssistantState *state = context;
+    AssistantFile *file = state->ftp_entry;
+    if (!file || !state->ftp_file) return false;
+    uint64_t started = OSGetTime();
+    bool ok = complete && state->ftp_written == file->size_bytes;
+    if (fflush(state->ftp_file) != 0) ok = false;
+    if (fclose(state->ftp_file) != 0) ok = false;
+    state->ftp_file = NULL;
+    state->ftp_write_ticks += OSGetTime() - started;
+    free(state->ftp_stdio_buffer); state->ftp_stdio_buffer = NULL;
+    struct stat persisted;
+    if (ok && (stat(file->staged_path, &persisted) != 0 || !S_ISREG(persisted.st_mode)
+        || (long long)persisted.st_size != file->size_bytes)) ok = false;
+    if (ok) {
+        file->uploaded = true; /* received only; full SHA-256 is mandatory at commit */
+        state->transfer.uploaded_files++;
+        state->transfer.uploaded_bytes += file->size_bytes;
+        char timing[UIF_MAX_TEXT];
+        snprintf(timing, sizeof(timing), "FTP received %lld B in %llu ms; SD write/flush %llu ms; owner %u calls/%llu ms; redraw %u calls/%llu ms. Full verification pending.",
+            file->size_bytes, (unsigned long long)OSTicksToMilliseconds(OSGetTime() - state->file_started_ticks),
+            (unsigned long long)OSTicksToMilliseconds(state->ftp_write_ticks),
+            state->ftp_owner_service_calls, (unsigned long long)OSTicksToMilliseconds(state->ftp_owner_service_ticks),
+            state->ftp_redraw_calls, (unsigned long long)OSTicksToMilliseconds(state->ftp_redraw_ticks));
+        append_activity(state, timing);
+        AssistantFtpDiagnostics diagnostics;
+        if (assistant_ftp_get_diagnostics(state->ftp_server, &diagnostics)) {
+            const AssistantFtpSocketOption *options[] = {
+                &diagnostics.window_scale, &diagnostics.receive_buffer, &diagnostics.send_buffer
+            };
+            for (unsigned int i = 0; i < 3; i++) {
+                const AssistantFtpSocketOption *option = options[i];
+                snprintf(timing, sizeof(timing),
+                    "FTP socket v1 %u: supported %u attempted %u requested %d before %d/%d setError %d after %d/%d.",
+                    i, (unsigned int)option->supported, (unsigned int)option->attempted,
+                    option->requested, option->before_value, option->before_error,
+                    option->set_error, option->after_value, option->after_error);
+                append_activity(state, timing);
+            }
+            snprintf(timing, sizeof(timing),
+                "FTP recv v1: pumps %llu calls %llu positive %llu bytes %llu blocked %llu interrupted %llu EOF %llu errors %llu.",
+                (unsigned long long)diagnostics.pump_calls, (unsigned long long)diagnostics.receive_calls,
+                (unsigned long long)diagnostics.positive_receives, (unsigned long long)diagnostics.received_bytes,
+                (unsigned long long)diagnostics.would_block, (unsigned long long)diagnostics.interrupted,
+                (unsigned long long)diagnostics.end_of_file,
+                (unsigned long long)diagnostics.receive_errors);
+            append_activity(state, timing);
+            snprintf(timing, sizeof(timing), "FTP recv sizes v1: lt1024 %llu lt16384 %llu lt65536 %llu rest %llu.",
+                (unsigned long long)diagnostics.receive_size_buckets[0],
+                (unsigned long long)diagnostics.receive_size_buckets[1],
+                (unsigned long long)diagnostics.receive_size_buckets[2],
+                (unsigned long long)diagnostics.receive_size_buckets[3]);
+            append_activity(state, timing);
+        }
+        snprintf(timing, sizeof(timing), "FTP wait v1: sleep %llu calls/%llu ms select %llu calls/%llu ms.",
+            (unsigned long long)state->ftp_sleep_calls,
+            (unsigned long long)OSTicksToMilliseconds(state->ftp_sleep_ticks),
+            (unsigned long long)state->ftp_select_calls,
+            (unsigned long long)OSTicksToMilliseconds(state->ftp_select_ticks));
+        append_activity(state, timing);
+    } else {
+        remove(file->staged_path);
+        record_transfer_result(state, "failed", false, false, "FTP upload incomplete or could not be persisted; no package was committed.", file->relative_path);
+    }
+    state->ftp_entry = NULL;
+    clear_receiving_file_state(state);
+    return ok;
+}
+
+static void stop_ftp_transfer(AssistantState *state)
+{
+    if (!state->ftp_server) return;
+    assistant_ftp_destroy(state->ftp_server); /* closes/drains before SD cleanup */
+    state->ftp_server = NULL;
 }
 
 static void handle_start_transfer(int fd, AssistantState *state, const HttpRequest *request)
@@ -3200,16 +3509,32 @@ static void handle_start_transfer(int fd, AssistantState *state, const HttpReque
         return;
     }
 
+    uint16_t ftp_port = 0;
+    if (state->transfer.ftp_bulk) {
+        struct sockaddr_in peer;
+        socklen_t peer_size = sizeof(peer);
+        const AssistantFtpCallbacks callbacks = {ftp_begin_file, ftp_write_file, ftp_finish_file, ftp_progress_file};
+        if (getpeername(fd, (struct sockaddr *)&peer, &peer_size) == 0 && peer.sin_family == AF_INET)
+            state->ftp_server = assistant_ftp_start(state, state->transfer.transfer_id, authorization_token(request),
+                peer.sin_addr.s_addr, &callbacks, &ftp_port);
+        if (!state->ftp_server) {
+            record_transfer_result(state, "failed", false, false, "Scoped FTP receiver could not start; no files accepted.", "");
+            remove_tree(state->transfer.incoming_root);
+            memset(&state->transfer, 0, sizeof(state->transfer));
+            send_message(fd, 503, "Service Unavailable", "Scoped FTP receiver could not start; no files accepted.");
+            return;
+        }
+    }
     char status[UIF_MAX_TEXT];
     snprintf(status, sizeof(status), "Transfer %s ready: %d files.", state->transfer.transfer_id, state->transfer.file_count);
     set_status(state, status);
 
-    char json[256];
-    snprintf(
-        json,
-        sizeof(json),
-        "{\"transferId\":\"%s\",\"message\":\"Transfer created.\"}",
-        state->transfer.transfer_id);
+    char json[512];
+    if (state->transfer.ftp_bulk)
+        snprintf(json, sizeof(json), "{\"transferId\":\"%s\",\"message\":\"Transfer created.\",\"bulkTransport\":\"ftp\",\"ftpPort\":%u,\"ftpUsername\":\"%s\"}",
+            state->transfer.transfer_id, ftp_port, state->transfer.transfer_id);
+    else
+        snprintf(json, sizeof(json), "{\"transferId\":\"%s\",\"message\":\"Transfer created.\"}", state->transfer.transfer_id);
     send_json(fd, 200, "OK", json);
 }
 
@@ -3225,6 +3550,11 @@ static void handle_upload(int fd, AssistantState *state, const HttpRequest *requ
     if (!transfer->active || strcmp(transfer->transfer_id, transfer_id) != 0)
     {
         send_message(fd, 404, "Not Found", "Transfer ID is not active.");
+        return;
+    }
+
+    if (transfer->ftp_bulk) {
+        send_message(fd, 409, "Conflict", "Use the negotiated FTP endpoint for this transfer.");
         return;
     }
 
@@ -3343,6 +3673,28 @@ static void handle_commit(int fd, AssistantState *state, const HttpRequest *requ
         return;
     }
 
+    if (state->transfer.ftp_bulk && !state->transfer.ftp_sealed) {
+        if (!state->ftp_server || assistant_ftp_failed(state->ftp_server)) {
+            send_message(fd, 400, "Bad Request", "FTP upload failed. Cancel this transfer; no package was committed.");
+            return;
+        }
+        if (assistant_ftp_busy(state->ftp_server)) {
+            send_message(fd, 409, "Conflict", "FTP data is still active. Wait for its result before committing.");
+            return;
+        }
+        if (state->transfer.uploaded_files != state->transfer.file_count
+            || state->transfer.uploaded_bytes != state->transfer.total_bytes) {
+            send_message(fd, 409, "Conflict", "FTP transfer is missing files. No package was committed.");
+            return;
+        }
+        if (!assistant_ftp_seal(state->ftp_server)) {
+            send_message(fd, 409, "Conflict", "FTP writers could not be sealed. No package was committed.");
+            return;
+        }
+        stop_ftp_transfer(state);
+        state->transfer.ftp_sealed = true;
+    }
+
     char error[UIF_MAX_TEXT];
     if (!commit_transfer(state, error, sizeof(error)))
     {
@@ -3434,6 +3786,25 @@ static void handle_transfer_status(int fd, AssistantState *state, const HttpRequ
     if (!transfer->active || strcmp(transfer->transfer_id, transfer_id) != 0)
     {
         const AssistantTransferResult *result = find_transfer_result(state, transfer_id);
+        AssistantTransferResult recovered;
+        if (!result)
+        {
+            char journal[UIF_MAX_PATH]; bool recorded_success = false;
+            join_path(journal, sizeof(journal), state->sd_root, "uinjectforge/assistant/install-requests");
+            if (assistant_staged_install_read_result(journal, transfer_id, &recorded_success))
+            {
+                memset(&recovered, 0, sizeof(recovered));
+                recovered.has_result = true;
+                recovered.success = recorded_success;
+                copy_text(recovered.transfer_id, sizeof(recovered.transfer_id), transfer_id);
+                copy_text(recovered.status, sizeof(recovered.status), recorded_success ? "installed" : "install-failed");
+                copy_text(recovered.target_root, sizeof(recovered.target_root), "USB");
+                copy_text(recovered.package_kind, sizeof(recovered.package_kind), "Installable");
+                copy_text(recovered.post_transfer_action, sizeof(recovered.post_transfer_action), "install-existing-usb");
+                copy_text(recovered.message, sizeof(recovered.message), "Recovered the recorded USB installation result. Current installed content was not verified.");
+                result = &recovered;
+            }
+        }
         if (result)
         {
             char result_json[8192], json[8448];
@@ -3535,6 +3906,7 @@ static void handle_cancel_transfer(int fd, AssistantState *state, const HttpRequ
         return;
     }
 
+    stop_ftp_transfer(state);
     record_transfer_result(state, "canceled", false, true, "Transfer canceled and staging folder removed.", "");
     remove_tree(state->transfer.incoming_root);
     memset(&state->transfer, 0, sizeof(state->transfer));
@@ -3646,7 +4018,7 @@ static int append_installed_titles_from_storage(
             if (entry_length < 0
                 || (size_t)entry_length >= sizeof(entry_json)
                 || *offset >= json_size
-                || separator_length + (size_t)entry_length + 512U > json_size - *offset)
+                || separator_length + (size_t)entry_length + 1024U > json_size - *offset)
             {
                 if (truncated)
                     *truncated = true;
@@ -3694,7 +4066,7 @@ static bool append_catalog_json(const AssistantTitleLocation *title, void *conte
         "%s{\"titleId\":\"%s\",\"name\":\"%s\",\"version\":\"%u\",\"productCode\":\"\",\"storageTarget\":\"%s\",\"pathHint\":\"%s/\"}",
         *output->first ? "" : ",", title->title_id, title->title_id, title->version,
         title->usb ? "USB" : "NAND / MLC", path);
-    if (length < 0 || (size_t)length >= sizeof(entry) || *output->offset + (size_t)length + 512 >= output->capacity)
+    if (length < 0 || (size_t)length >= sizeof(entry) || *output->offset + (size_t)length + 1024 >= output->capacity)
         return false;
     memcpy(output->json + *output->offset, entry, (size_t)length + 1);
     *output->offset += (size_t)length;
@@ -3746,8 +4118,10 @@ static void handle_installed_titles(int fd, AssistantState *state, const HttpReq
         &truncated);
 
     bool catalog_available = false;
+    bool catalog_attempted = false;
     if ((!nand_readable || !usb_readable) && !truncated)
     {
+        catalog_attempted = true;
         CatalogJsonContext catalog = {json, json_capacity, &offset, &first, nand_readable, usb_readable, 0};
         catalog_available = assistant_visit_title_catalog(append_catalog_json, &catalog, &truncated);
         count += catalog.count;
@@ -3764,20 +4138,120 @@ static void handle_installed_titles(int fd, AssistantState *state, const HttpReq
     else if (!usb_readable)
         message = "NAND titles loaded; the USB title root was unavailable or no USB storage is attached.";
 
+    AssistantCatalogDiagnostics diagnostic = catalog_attempted
+        ? assistant_catalog_diagnostics() : (AssistantCatalogDiagnostics){-1, -1, -1, 0, 0};
     append_format(
         json,
         json_capacity,
         &offset,
-        "],\"count\":%d,\"nandReadable\":%s,\"usbReadable\":%s,\"truncated\":%s,\"catalogAvailable\":%s,\"message\":\"%s\"}",
+        "],\"count\":%d,\"nandReadable\":%s,\"usbReadable\":%s,\"truncated\":%s,\"catalogAvailable\":%s,\"catalogStage\":\"%s\",\"catalogError\":%d,\"catalogExpectedCount\":%d,\"catalogReturnedCount\":%d,\"catalogObservedCount\":%d,\"catalogCapacityBytes\":%u,\"catalogAttempts\":%u,\"message\":\"%s\"}",
         count,
         nand_readable ? "true" : "false",
         usb_readable ? "true" : "false",
         truncated ? "true" : "false",
         catalog_available ? "true" : "false",
+        catalog_attempted ? assistant_catalog_stage() : "not-requested",
+        catalog_attempted ? (int)assistant_catalog_error() : 0,
+        (int)diagnostic.expected_count,
+        (int)diagnostic.returned_count,
+        (int)diagnostic.observed_count,
+        diagnostic.capacity_bytes,
+        diagnostic.attempts,
         message);
     send_json(fd, 200, "OK", json);
     free(json);
 }
+typedef struct {
+    char *json;
+    size_t capacity;
+    size_t offset;
+    bool first;
+} CatalogProbeJsonContext;
+
+static bool append_catalog_probe_json(const AssistantCatalogProbeRecord *record, void *context)
+{
+    CatalogProbeJsonContext *output = context;
+    char path[352], device[72], entry[640];
+    json_escape(record->path, path, sizeof(path));
+    json_escape(record->indexed_device, device, sizeof(device));
+    int length = snprintf(entry, sizeof(entry),
+        "%s{\"titleId\":\"%s\",\"indexedDevice\":\"%s\",\"path\":\"%s\",\"appType\":\"%08X\",\"version\":%u,\"valid\":%s}",
+        output->first ? "" : ",", record->title_id, device, path, record->app_type,
+        record->version, record->valid ? "true" : "false");
+    if (length < 0 || (size_t)length >= sizeof(entry) || output->offset + (size_t)length + 1024 >= output->capacity)
+        return false;
+    memcpy(output->json + output->offset, entry, (size_t)length + 1);
+    output->offset += (size_t)length;
+    output->first = false;
+    return true;
+}
+
+static void handle_catalog_probe(int fd, AssistantState *state, const HttpRequest *request, const char *mode)
+{
+    if (!authorization_ok(state, request)) {
+        send_message(fd, 401, "Unauthorized", "Assistant pairing is required for catalog diagnostics.");
+        return;
+    }
+    if (state->transfer.active || state->receiving_file || state->verifying_files || state->install_active
+        || state->auto_install_pending || state->title_launch_pending) {
+        send_message(fd, 409, "Conflict", "Catalog diagnostics require an idle Assistant.");
+        return;
+    }
+    if (strncmp(mode, "folders/", 8) == 0) {
+        const char *title_id = mode + 8;
+        if (!assistant_title_folder_id_valid(title_id)) {
+            send_message(fd, 400, "Bad Request", "Expected a generated title ID, not a filesystem path.");
+            return;
+        }
+        AssistantTitleFolderResult result = assistant_check_title_folders(title_id);
+        const char *state_name = result.state == ASSISTANT_TITLE_FOLDERS_ABSENT ? "absent"
+            : result.state == ASSISTANT_TITLE_FOLDERS_PRESENT ? "present" : "unknown";
+        char json[512];
+        snprintf(json, sizeof(json),
+            "{\"diagnosticOnly\":true,\"safeForInstallation\":false,\"buildId\":\"" UIF_COMPONENT_BUILD_ID "\",\"titleId\":\"%s\",\"state\":\"%s\",\"stage\":\"%s\",\"error\":%d,\"checkedLocations\":%u}",
+            title_id, state_name, result.stage, (int)result.error, result.checked_locations);
+        send_json(fd, 200, "OK", json);
+        return;
+    }
+    AssistantCatalogProbeKind kind;
+    uint32_t filter_value = 0;
+    if (strcmp(mode, "count-sized") == 0) kind = ASSISTANT_PROBE_COUNT_SIZED;
+    else if (strcmp(mode, "expanded") == 0) kind = ASSISTANT_PROBE_EXPANDED;
+    else if (strcmp(mode, "device/usb") == 0) { kind = ASSISTANT_PROBE_DEVICE_TYPE; filter_value = ASSISTANT_PROBE_DEVICE_USB; }
+    else if (strcmp(mode, "device/mlc") == 0) { kind = ASSISTANT_PROBE_DEVICE_TYPE; filter_value = ASSISTANT_PROBE_DEVICE_MLC; }
+    else if (strcmp(mode, "device/odd") == 0) { kind = ASSISTANT_PROBE_DEVICE_TYPE; filter_value = ASSISTANT_PROBE_DEVICE_ODD; }
+    else if (strcmp(mode, "device/slc") == 0) { kind = ASSISTANT_PROBE_SYSTEM_DEVICE; filter_value = 0; }
+    else if (strcmp(mode, "device/slccmpt") == 0) { kind = ASSISTANT_PROBE_SYSTEM_DEVICE; filter_value = 1; }
+    else if (strncmp(mode, "app-type/", 9) == 0 && strlen(mode + 9) == 8) {
+        for (size_t i = 9; i < 17; i++) {
+            if (!isxdigit((unsigned char)mode[i])) {
+                send_message(fd, 400, "Bad Request", "Invalid diagnostic app type.");
+                return;
+            }
+        }
+        filter_value = (uint32_t)strtoul(mode + 9, NULL, 16);
+        kind = ASSISTANT_PROBE_APP_TYPE;
+    } else {
+        send_message(fd, 400, "Bad Request", "Unknown catalog diagnostic mode.");
+        return;
+    }
+    const size_t capacity = 524288;
+    char *json = malloc(capacity);
+    if (!json) { send_message(fd, 500, "Internal Server Error", "Diagnostic response allocation failed."); return; }
+    CatalogProbeJsonContext output = {json, capacity, 0, true};
+    append_format(json, capacity, &output.offset,
+        "{\"diagnosticOnly\":true,\"safeForInstallation\":false,\"buildId\":\"" UIF_COMPONENT_BUILD_ID "\",\"records\":[");
+    AssistantCatalogProbeResult result;
+    bool captured = assistant_probe_title_catalog(kind, filter_value, append_catalog_probe_json, &output, &result);
+    append_format(json, capacity, &output.offset,
+        "],\"success\":%s,\"mode\":\"%s\",\"stage\":\"%s\",\"error\":%d,\"expectedCount\":%d,\"returnedCount\":%d,\"observedCount\":%d,\"capacityBytes\":%u,\"exportedCount\":%u,\"recordsValid\":%s,\"truncated\":%s}",
+        captured ? "true" : "false", mode, result.stage, result.error, result.expected_count,
+        result.returned_count, result.observed_count, result.capacity_bytes, result.exported_count,
+        result.records_valid ? "true" : "false", captured ? "false" : "true");
+    send_json(fd, 200, "OK", json);
+    free(json);
+}
+
 static bool queue_title_launch(
     AssistantState *state,
     const char *title_id,
@@ -4342,6 +4816,98 @@ static bool title_type_can_install(uint32_t title_id_high)
         || title_id_high == 0x0005000E;
 }
 
+typedef struct { const char *title_id; bool found; } StagedTitleLookup;
+static bool staged_title_match(const AssistantTitleLocation *title, void *context)
+{
+    StagedTitleLookup *lookup = context;
+    if (strcasecmp(lookup->title_id, title->title_id)) return true;
+    lookup->found = true;
+    return false;
+}
+
+static bool validate_staged_install(const char *path, const AssistantStagedInstallRequest *request, char *error, size_t capacity)
+{
+    char title_id[17], digest[65];
+    if (!assistant_staged_install_identity(path, title_id, digest)
+        || strcmp(title_id, request->title_id) || strcmp(digest, request->tmd_sha256)) {
+        snprintf(error, capacity, "Install blocked: package changed, is incomplete, or lacks a valid USB policy.");
+        return false;
+    }
+    StagedTitleLookup lookup = {request->title_id, false};
+    bool truncated = false;
+    bool complete = assistant_visit_title_catalog(staged_title_match, &lookup, &truncated);
+    if (lookup.found || SYSCheckTitleExists(strtoull(request->title_id, NULL, 16))) {
+        snprintf(error, capacity, "Install blocked: title %s is already installed. Existing titles are never replaced remotely.", request->title_id);
+        return false;
+    }
+    if (!complete || truncated) {
+        AssistantTitleFolderResult folders = assistant_check_title_folders(request->title_id);
+        if (folders.state == ASSISTANT_TITLE_FOLDERS_PRESENT) {
+            snprintf(error, capacity, "Install blocked: title %s is already installed. Existing titles are never replaced remotely.", request->title_id);
+            return false;
+        }
+        if (folders.state != ASSISTANT_TITLE_FOLDERS_ABSENT || folders.error != 0
+            || folders.checked_locations < 2 || folders.checked_locations > 3) {
+            snprintf(error, capacity, "Install blocked: cannot verify installed titles (%s, error %d; folders %s, error %d).",
+                assistant_catalog_stage(), (int)assistant_catalog_error(), folders.stage, (int)folders.error);
+            return false;
+        }
+    }
+    return true;
+}
+
+static void handle_staged_install(int fd, AssistantState *state, const HttpRequest *request)
+{
+    if (!authorization_ok(state, request)) {
+        send_message(fd, 401, "Unauthorized", "Pairing is required to install an SD package."); return;
+    }
+    if (state->transfer.active || state->receiving_file || state->verifying_files || state->install_active
+        || state->auto_install_pending || state->title_launch_pending) {
+        send_message(fd, 409, "Conflict", "Wait for active transfers, installations and launches to finish."); return;
+    }
+    if (!state->install_enabled || !state->auto_install_enabled) {
+        send_message(fd, 403, "Forbidden", "Enable automatic installation in Assistant settings first."); return;
+    }
+    char *body = NULL;
+    if (request->content_length <= 0 || request->content_length > 2048 || !read_body_to_memory(fd, request, &body)) {
+        send_message(fd, 400, "Bad Request", "Invalid install request size."); return;
+    }
+    AssistantStagedInstallRequest install;
+    bool parsed = !memchr(body, 0, (size_t)request->content_length) && assistant_staged_install_parse(body, &install);
+    free(body);
+    if (!parsed) { send_message(fd, 400, "Bad Request", "Expected an SD package identity, unique request ID and USB target."); return; }
+    char path[UIF_MAX_PATH], mcp_path[UIF_MAX_PATH], error[UIF_MAX_TEXT];
+    if (!validate_install_package_for_install(state, install.package_name, path, sizeof(path), mcp_path, sizeof(mcp_path), error, sizeof(error))
+        || !validate_staged_install(path, &install, error, sizeof(error))) {
+        send_message(fd, 409, "Conflict", error); return;
+    }
+    char journal[UIF_MAX_PATH];
+    join_path(journal, sizeof(journal), state->sd_root, "uinjectforge/assistant/install-requests");
+    if (!mkdir_recursive(journal) || !assistant_staged_install_claim(journal, &install)) {
+        send_message(fd, 409, "Conflict", "Request or package was already claimed, or its receipt could not be saved. Inspect the console; do not replay installation."); return;
+    }
+    g_staged_install = install;
+    memset(&state->auto_install_action, 0, sizeof(state->auto_install_action));
+    state->auto_install_action.type = ASSISTANT_UI_ACTION_INSTALL_TO_USB;
+    copy_text(state->auto_install_action.package_name, sizeof(state->auto_install_action.package_name), install.package_name);
+    AssistantTransferResult *result = &state->pending_install_result;
+    memset(result, 0, sizeof(*result));
+    result->has_result = result->success = true;
+    copy_text(result->transfer_id, sizeof(result->transfer_id), install.request_id);
+    copy_text(result->package_display_name, sizeof(result->package_display_name), install.package_name);
+    copy_text(result->package_kind, sizeof(result->package_kind), "Installable");
+    copy_text(result->target_root, sizeof(result->target_root), "USB");
+    copy_text(result->post_transfer_action, sizeof(result->post_transfer_action), "install-existing-usb");
+    copy_text(result->status, sizeof(result->status), "install-queued");
+    copy_text(result->message, sizeof(result->message), "Existing SD package queued for USB installation. No files uploaded.");
+    state->auto_install_pending = true;
+    store_transfer_result(state, result);
+    set_status(state, result->message);
+    char json[256];
+    snprintf(json, sizeof(json), "{\"success\":true,\"message\":\"USB installation queued.\",\"transferId\":\"%s\"}", install.request_id);
+    send_json(fd, 202, "Accepted", json);
+}
+
 static const char *install_error_hint(IOSError error)
 {
     switch ((uint32_t)error)
@@ -4414,6 +4980,12 @@ static void complete_install_result(AssistantState *state, AssistantInstallConte
     copy_text(job->transfer_result.status, sizeof(job->transfer_result.status), success ? "installed" : "install-failed");
     copy_text(job->transfer_result.message, sizeof(job->transfer_result.message), state->status);
     job->transfer_result.completed_ticks = OSGetTime();
+    if (equals_ignore_case(job->transfer_result.post_transfer_action, "install-existing-usb")) {
+        char journal[UIF_MAX_PATH];
+        join_path(journal, sizeof(journal), state->sd_root, "uinjectforge/assistant/install-requests");
+        if (!assistant_staged_install_record_result(journal, job->transfer_result.transfer_id, success))
+            append_activity(state, "Install result remains available for this session only; its receipt could not be saved.");
+    }
     store_transfer_result(state, &job->transfer_result);
 }
 
@@ -4422,6 +4994,13 @@ static void finish_install(AssistantState *state, bool success)
     AssistantInstallContext *job = &g_install;
     if (job->submitted && !g_install_completed) return;
     __sync_synchronize();
+    int32_t folder_close_error = assistant_close_title_folder_session(&job->folder_session);
+    if (folder_close_error) {
+        char message[UIF_MAX_TEXT];
+        snprintf(message, sizeof(message), "Install outcome requires inspection: filesystem client cleanup %d.", (int)folder_close_error);
+        set_status(state, message);
+        success = false;
+    }
     if (!g_procui_exit_requested) {
         record_install_telemetry(state, success ? "install-complete" : "install-failed",
             &job->action, job->action.type == ASSISTANT_UI_ACTION_INSTALL_TO_USB ? "USB" : "NAND",
@@ -4572,6 +5151,7 @@ static bool perform_install_action(AssistantState *state, const AssistantUiActio
     job->home_was_enabled = OSIsHomeButtonMenuEnabled();
     OSEnableHomeButtonMenu(false);
     state->install_active = true;
+    update_power_guard(state, false);
     state->install_done_bytes = 0;
     state->install_total_bytes = 0;
     assistant_ui_set_install_active(true);
@@ -4612,6 +5192,15 @@ static bool perform_install_action(AssistantState *state, const AssistantUiActio
         goto cleanup;
     }
 
+    if (automatic && !strcmp(job->transfer_result.post_transfer_action, "install-existing-usb")) {
+        AssistantTitleFolderResult preparation;
+        if (!assistant_open_title_folder_session(&job->folder_session, &preparation)) {
+            snprintf(status, sizeof(status), "Install blocked: filesystem preflight %s, error %d.", preparation.stage, (int)preparation.error);
+            set_status(state, status);
+            goto cleanup;
+        }
+    }
+
     memset(install_info, 0, sizeof(MCPInstallInfo));
     MCPError result = MCP_InstallGetInfo(handle, mcp_package_path, install_info);
     if (result != 0)
@@ -4623,6 +5212,38 @@ static bool perform_install_action(AssistantState *state, const AssistantUiActio
 
     uint32_t *install_words = (uint32_t *)install_info;
     uint32_t title_id_high = install_words[0];
+    if (automatic && !strcmp(job->transfer_result.post_transfer_action, "install-existing-usb")) {
+        uint64_t observed = ((uint64_t)install_words[0] << 32) | install_words[1];
+        copy_text(status, sizeof(status), "Install blocked: queued package identity changed.");
+        if (!to_usb || strcmp(job->transfer_result.transfer_id, g_staged_install.request_id)
+            || observed != strtoull(g_staged_install.title_id, NULL, 16)
+            || !validate_staged_install(fs_package_path, &g_staged_install, status, sizeof(status))) {
+            set_status(state, status);
+            goto cleanup;
+        }
+        job->observed_title_id = observed;
+        // Keep the full late catalog/collision check above. Its temporary MCP
+        // clients can disturb install setup; restore that setup, then repeat
+        // identity AND current folder absence without opening any MCP client.
+        memset(install_info, 0, sizeof(MCPInstallInfo));
+        result = MCP_InstallGetInfo(handle, mcp_package_path, install_info);
+        char current_id[17], current_digest[65];
+        uint32_t *current_words = (uint32_t *)install_info;
+        uint64_t current_title = ((uint64_t)current_words[0] << 32) | current_words[1];
+        if (result != 0 || current_title != observed
+            || !assistant_staged_install_identity(fs_package_path, current_id, current_digest)
+            || strcmp(current_id, g_staged_install.title_id) || strcmp(current_digest, g_staged_install.tmd_sha256)) {
+            set_status(state, "Install blocked: package identity/setup changed after the late collision check.");
+            goto cleanup;
+        }
+        AssistantTitleFolderResult final_folders = assistant_check_title_folders_in_session(g_staged_install.title_id, &job->folder_session);
+        if (final_folders.state != ASSISTANT_TITLE_FOLDERS_ABSENT || final_folders.error != 0
+            || final_folders.checked_locations < 2 || final_folders.checked_locations > 3) {
+            snprintf(status, sizeof(status), "Install blocked: final folder check %s, error %d.", final_folders.stage, (int)final_folders.error);
+            set_status(state, status);
+            goto cleanup;
+        }
+    }
     if (!title_type_can_install(title_id_high))
     {
         snprintf(status, sizeof(status), "Install blocked: unsupported title type %08X.", title_id_high);
@@ -4677,7 +5298,7 @@ cleanup:
     return false;
 }
 
-static int append_install_packages(char *json, size_t json_size, size_t *offset, const AssistantState *state)
+static int append_install_packages(char *json, size_t json_size, size_t *offset, const AssistantState *state, bool *truncated)
 {
     char install_root[UIF_MAX_PATH];
     join_path(install_root, sizeof(install_root), state->sd_root, "install");
@@ -4714,6 +5335,8 @@ static int append_install_packages(char *json, size_t json_size, size_t *offset,
         bool has_tmd = path_is_regular_file(tmd_path);
         bool has_cert = path_is_regular_file(cert_path);
         bool looks_installable = has_ticket && has_tmd && has_cert && app_count > 0;
+        char title_id[17], tmd_digest[65];
+        bool remote_eligible = assistant_staged_install_identity(package_path, title_id, tmd_digest);
         char missing_required[128];
         size_t missing_offset = 0;
         int missing_count = 0;
@@ -4770,11 +5393,11 @@ static int append_install_packages(char *json, size_t json_size, size_t *offset,
         json_escape(missing_required, escaped_missing, sizeof(escaped_missing));
         json_escape(validation_summary, escaped_validation_summary, sizeof(escaped_validation_summary));
 
-        append_format(
-            json,
-            json_size,
-            offset,
-            "%s{\"name\":\"%s\",\"path\":\"%s\",\"hasTicket\":%s,\"hasTmd\":%s,\"hasCert\":%s,\"appCount\":%d,\"h3Count\":%d,\"looksInstallable\":%s,\"validationStatus\":\"%s\",\"requiredMissingCount\":%d,\"missingRequired\":\"%s\",\"validationSummary\":\"%s\"}",
+        char item[4096];
+        int item_length = snprintf(
+            item,
+            sizeof(item),
+            "%s{\"name\":\"%s\",\"path\":\"%s\",\"hasTicket\":%s,\"hasTmd\":%s,\"hasCert\":%s,\"appCount\":%d,\"h3Count\":%d,\"looksInstallable\":%s,\"validationStatus\":\"%s\",\"requiredMissingCount\":%d,\"missingRequired\":\"%s\",\"validationSummary\":\"%s\",\"titleId\":\"%s\",\"tmdSha256\":\"%s\",\"remoteInstallEligible\":%s}",
             first ? "" : ",",
             escaped_name,
             escaped_path,
@@ -4787,12 +5410,19 @@ static int append_install_packages(char *json, size_t json_size, size_t *offset,
             looks_installable ? "ready" : "incomplete",
             missing_count,
             escaped_missing,
-            escaped_validation_summary);
+            escaped_validation_summary,
+            title_id,
+            tmd_digest,
+            remote_eligible ? "true" : "false");
+        if (item_length < 0 || (size_t)item_length >= sizeof(item) || *offset + (size_t)item_length + 512 >= json_size) {
+            *truncated = true;
+            break;
+        }
+        memcpy(json + *offset, item, (size_t)item_length + 1);
+        *offset += (size_t)item_length;
         first = false;
         count++;
 
-        if (*offset + 512 >= json_size)
-            break;
     }
 
     closedir(root);
@@ -4815,8 +5445,9 @@ static void handle_install_packages(int fd, AssistantState *state, const HttpReq
     char json[32768];
     size_t offset = 0;
     append_format(json, sizeof(json), &offset, "{\"success\":true,\"message\":\"SD install package list loaded.\",\"installRoot\":\"%s\",\"packages\":[", escaped_root);
-    int count = append_install_packages(json, sizeof(json), &offset, state);
-    append_format(json, sizeof(json), &offset, "],\"count\":%d}", count);
+    bool truncated = false;
+    int count = append_install_packages(json, sizeof(json), &offset, state, &truncated);
+    append_format(json, sizeof(json), &offset, "],\"count\":%d,\"truncated\":%s}", count, truncated ? "true" : "false");
     send_json(fd, 200, "OK", json);
 }
 
@@ -4923,7 +5554,7 @@ static void handle_log(int fd, AssistantState *state, const HttpRequest *request
 static void handle_request(int fd, AssistantState *state)
 {
     HttpRequest request;
-    if (!parse_http_request(fd, &request, (state->install_active || state->receiving_file) ? 500 : 10000))
+    if (!parse_http_request(fd, &request, (state->install_active || state->receiving_file || state->verifying_files || state->ftp_server) ? 500 : 10000))
     {
         state->http_request_count++;
         copy_text(state->last_http_request, sizeof(state->last_http_request), "unparsed request");
@@ -4942,7 +5573,12 @@ static void handle_request(int fd, AssistantState *state)
 
     // During an upload, nested servicing is read-only and cannot invalidate file pointers.
     // Install-time writes are restricted to the separate transfer staging transaction.
-    if ((state->receiving_file && !assistant_request_allowed_during_install(request.method, request.path))
+    char ftp_cancel_path[128];
+    snprintf(ftp_cancel_path, sizeof(ftp_cancel_path), "/api/v1/transfers/%s", state->transfer.transfer_id);
+    bool ftp_cancel = state->transfer.ftp_bulk && !state->verifying_files
+        && strcmp(request.method, "DELETE") == 0 && strcmp(request.path, ftp_cancel_path) == 0;
+    if (((state->receiving_file || state->verifying_files)
+            && !assistant_request_allowed_during_install(request.method, request.path) && !ftp_cancel)
         || (state->install_active && !assistant_request_allowed_with_install(request.method, request.path)))
     {
         send_message(fd, 409, "Conflict", "This operation is busy. Status remains available; title changes must wait.");
@@ -4967,9 +5603,24 @@ static void handle_request(int fd, AssistantState *state)
         return;
     }
 
+    if ((strcmp(request.method, "POST") == 0 && strcmp(request.path, "/api/v1/pair/remember") == 0)
+        || ((strcmp(request.method, "GET") == 0 || strcmp(request.method, "DELETE") == 0)
+            && strcmp(request.path, "/api/v1/pair") == 0))
+    {
+        handle_remembered_pairing(fd, state, &request);
+        return;
+    }
+
     if (strcmp(request.method, "POST") == 0 && strcmp(request.path, "/api/v1/transfers") == 0)
     {
         handle_start_transfer(fd, state, &request);
+        return;
+    }
+
+    const char *catalog_probe_prefix = "/api/v1/diagnostics/title-catalog/";
+    if (strcmp(request.method, "GET") == 0 && strncmp(request.path, catalog_probe_prefix, strlen(catalog_probe_prefix)) == 0)
+    {
+        handle_catalog_probe(fd, state, &request, request.path + strlen(catalog_probe_prefix));
         return;
     }
 
@@ -5003,6 +5654,12 @@ static void handle_request(int fd, AssistantState *state)
     if (strcmp(request.method, "GET") == 0 && strcmp(request.path, "/api/v1/install-packages") == 0)
     {
         handle_install_packages(fd, state, &request);
+        return;
+    }
+
+    if (strcmp(request.method, "POST") == 0 && strcmp(request.path, "/api/v1/install-packages/install") == 0)
+    {
+        handle_staged_install(fd, state, &request);
         return;
     }
 
@@ -5120,7 +5777,7 @@ static void service_install_status_request(AssistantState *state)
     close(client_fd);
 }
 
-static bool wait_for_client(int server_fd)
+static bool wait_for_client(int server_fd, bool bulk_active)
 {
     fd_set set;
     FD_ZERO(&set);
@@ -5128,7 +5785,7 @@ static bool wait_for_client(int server_fd)
 
     struct timeval timeout;
     timeout.tv_sec = 0;
-    timeout.tv_usec = 100000;
+    timeout.tv_usec = bulk_active ? 0 : 100000;
 
     return select(server_fd + 1, &set, NULL, NULL, &timeout) > 0 && FD_ISSET(server_fd, &set);
 }
@@ -5287,7 +5944,6 @@ static bool initialize_services(AssistantState *state)
     memset(state, 0, sizeof(*state));
     state->server_fd = -1;
     state->broadcast_fd = -1;
-    state->pairing_code = create_pairing_code(state);
     copy_text(state->status, sizeof(state->status), "Starting receiver.");
 
     set_status(state, "Mounting SD card.");
@@ -5301,6 +5957,11 @@ static bool initialize_services(AssistantState *state)
     set_status(state, "Loading assistant config.");
     load_assistant_config(state);
     load_assistant_preferences(state);
+    if (!load_persistent_pairing_code(state)) return false;
+    char pairing_path[UIF_MAX_PATH];
+    if (join_path_checked(pairing_path, sizeof(pairing_path), state->sd_root, "uinjectforge/assistant/paired-devices.bin"))
+        assistant_pairing_load(&state->pairing_trust, pairing_path);
+    state->paired = state->pairing_trust.count > 0;
     set_status(state, "Checking interrupted transfers.");
     recover_assistant_storage(state);
 
@@ -5328,7 +5989,7 @@ static bool initialize_services(AssistantState *state)
     if (state->broadcast_enabled)
         state->broadcast_fd = start_broadcast_socket(state->broadcast_port);
 
-    set_status(state, "Receiver ready.");
+    set_status(state, state->settings_message[0] ? state->settings_message : "Receiver ready.");
     return true;
 }
 
@@ -5344,6 +6005,7 @@ static int initialize_services_thread(int argc, const char **argv)
 
 static void shutdown_services(AssistantState *state)
 {
+    stop_ftp_transfer(state);
     if (state->server_fd >= 0)
     {
         close(state->server_fd);
@@ -5366,7 +6028,7 @@ static void print_startup_screen(const AssistantState *state)
     WHBLogPrintf("Port: %d", state->http_port);
     WHBLogPrintf("Discovery probe replies: %s on UDP %d", state->broadcast_enabled ? "on" : "off", state->broadcast_port);
     WHBLogPrintf("Passive UDP broadcast: %s", state->passive_broadcast_enabled ? "on" : "off");
-    WHBLogPrintf("Pairing code: %06u", state->pairing_code);
+    WHBLogPrintf("Persistent pairing code loaded from SD.");
     WHBLogPrintf("SD root: %s", state->sd_root);
     WHBLogPrintf("");
     WHBLogPrintf("Open the UIF Assistant panel.");
@@ -5437,22 +6099,29 @@ int main(int argc, char **argv)
         state.install_enabled = true;
         state.manual_install_enabled = true;
         state.ui_scale = UIF_ASSISTANT_DEFAULT_UI_SCALE;
+        state.settings = assistant_settings_defaults();
+        state.network_settings = state.settings;
         copy_text(state.ip_address, sizeof(state.ip_address), "unknown");
         copy_text(state.status, sizeof(state.status), "Assistant could not start its background service thread. Restart the app.");
         print_startup_screen(&state);
     }
     unsigned int last_startup_status_sequence = 0;
     uint64_t last_heartbeat_ticks = OSGetTime();
+    AssistantUploadPump ftp_owner_pump = {0};
 
     while (!g_procui_exit_requested)
     {
-        if (!WHBProcIsRunning())
+        bool owner_control_due = assistant_upload_owner_control_due(&ftp_owner_pump,
+            state.ftp_server != NULL, OSTicksToMilliseconds(OSGetTime()));
+        uint64_t owner_service_started = owner_control_due ? OSGetTime() : 0;
+        AssistantFile *owner_service_file = state.ftp_entry;
+        if (owner_control_due && !WHBProcIsRunning())
         {
             g_procui_exit_requested = true;
             break;
         }
 
-        assistant_ui_poll_input();
+        if (owner_control_due) assistant_ui_poll_input();
 
         if (startup_thread_running)
         {
@@ -5492,43 +6161,54 @@ int main(int argc, char **argv)
             }
         }
 
-        if (initialized && !state.install_active)
+        if (owner_control_due && !state.install_active)
         {
             AssistantUiAction action;
             if (assistant_ui_take_action(&action))
             {
-                if (action.type == ASSISTANT_UI_ACTION_LAUNCH_TITLE)
+                if (!initialized && action.type != ASSISTANT_UI_ACTION_SAVE_SETTINGS
+                    && action.type != ASSISTANT_UI_ACTION_SET_AUTO_INSTALL)
+                    set_status(&state, "Receiver startup failed. Review Settings and restart Assistant.");
+                else if (action.type == ASSISTANT_UI_ACTION_LAUNCH_TITLE)
                 {
                     char error[UIF_MAX_TEXT];
                     if (!queue_title_launch(&state, action.title_id, error, sizeof(error)))
                         set_status(&state, error);
                 }
+                else if (action.type == ASSISTANT_UI_ACTION_FORGET_DEVICES)
+                {
+                    AssistantPairingTrust empty = {0};
+                    if (state.transfer.active)
+                        set_status(&state, "Finish or cancel the transfer before forgetting paired devices.");
+                    else if (!save_pairing_trust(&state, &empty))
+                        set_status(&state, "Could not save pairing changes on SD. Devices have not been forgotten.");
+                    else
+                    {
+                        memset(state.access_token, 0, sizeof(state.access_token));
+                        state.paired = false;
+                        unsigned int new_code = create_pairing_code(&state);
+                        if (assistant_settings_reset_pairing_code(state.sd_root, &state.settings, new_code,
+                            state.settings_message, sizeof(state.settings_message))) {
+                            state.pairing_code = new_code;
+                            set_status(&state, "All devices forgotten. New PIN saved to SD.");
+                        } else set_status(&state, "Devices forgotten. Could not save a new PIN; the existing PIN is unchanged.");
+                    }
+                }
                 else if (action.type == ASSISTANT_UI_ACTION_SET_AUTO_INSTALL)
                 {
                     if (action.enabled && !state.install_enabled)
                     {
-                        set_status(&state, "Automatic install cannot be enabled while install assistance is disabled in config.json.");
+                        set_status(&state, "Enable install assistance in Settings first.");
                     }
                     else
                     {
-                        bool previous = state.auto_install_enabled;
-                        state.auto_install_enabled = action.enabled;
-                        char error[UIF_MAX_TEXT];
-                        if (!save_assistant_preferences(&state, error, sizeof(error)))
-                        {
-                            state.auto_install_enabled = previous;
-                            set_status(&state, error);
-                        }
-                        else
-                        {
-                            set_status(
-                                &state,
-                                state.auto_install_enabled
-                                    ? "Automatic installs enabled. UIF still requires Copy and install for each transfer."
-                                    : "Automatic installs disabled. New packages will remain on SD for manual installation.");
-                        }
+                        AssistantSettings settings = state.settings;
+                        settings.auto_install_enabled = action.enabled;
+                        save_ui_settings(&state, &settings);
                     }
                 }
+                else if (action.type == ASSISTANT_UI_ACTION_SAVE_SETTINGS)
+                    save_ui_settings(&state, &action.settings);
                 else
                 {
                     perform_install_action(&state, &action, false);
@@ -5539,8 +6219,8 @@ int main(int argc, char **argv)
             }
         }
 
-        if (initialized) tick_install(&state);
-        if (initialized && state.auto_install_pending && !state.install_active)
+        if (owner_control_due && initialized) tick_install(&state);
+        if (owner_control_due && initialized && state.auto_install_pending && !state.install_active)
         {
             AssistantUiAction action = state.auto_install_action;
             state.auto_install_pending = false;
@@ -5555,23 +6235,57 @@ int main(int argc, char **argv)
             render_assistant_screen(&state);
         }
 
-        if (assistant_ui_take_refresh_request())
+        if (owner_control_due) update_power_guard(&state, false);
+        if (owner_control_due && assistant_ui_take_refresh_request())
             render_assistant_screen(&state);
 
-        if (initialized)
+        if (owner_control_due && initialized)
         {
             handle_discovery_probe(&state);
             send_discovery_broadcast(&state);
         }
 
-        if (initialized && wait_for_client(state.server_fd))
+        if (owner_control_due) {
+            uint64_t service_finished = OSGetTime();
+            if (owner_service_file && state.ftp_entry == owner_service_file) {
+                state.ftp_owner_service_ticks += service_finished - owner_service_started;
+                if (state.ftp_owner_service_calls != UINT_MAX) state.ftp_owner_service_calls++;
+            }
+            // Complete AFTER platform calls, so slow service cannot cause a tight retry loop.
+            assistant_upload_owner_control_complete(&ftp_owner_pump, state.ftp_server != NULL,
+                OSTicksToMilliseconds(service_finished));
+        }
+
+        if (initialized && state.ftp_server) {
+            assistant_ftp_pump(state.ftp_server, OSTicksToMilliseconds(OSGetTime()), UIF_UPLOAD_BUFFER);
+            static uint64_t last_ftp_render = 0;
+            uint64_t ftp_now = OSGetTime();
+            if (state.receiving_file && ftp_now - last_ftp_render >= OSMillisecondsToTicks(UIF_UPLOAD_RENDER_INTERVAL_MS)) {
+                uint64_t render_started = OSGetTime();
+                render_assistant_screen(&state);
+                if (state.ftp_entry) {
+                    state.ftp_redraw_ticks += OSGetTime() - render_started;
+                    if (state.ftp_redraw_calls != UINT_MAX) state.ftp_redraw_calls++;
+                }
+                last_ftp_render = ftp_now;
+            }
+        }
+
+        AssistantFile *select_file = state.ftp_entry;
+        uint64_t select_started = select_file ? OSGetTime() : 0;
+        bool client_ready = initialized && wait_for_client(state.server_fd, state.ftp_server != NULL);
+        if (select_file && state.ftp_entry == select_file) {
+            state.ftp_select_ticks += OSGetTime() - select_started;
+            state.ftp_select_calls++;
+        }
+        if (client_ready)
         {
             struct sockaddr_in client_address;
             socklen_t client_length = sizeof(client_address);
             int client_fd = accept(state.server_fd, (struct sockaddr *)&client_address, &client_length);
             if (client_fd >= 0)
             {
-                set_socket_timeouts(client_fd, false);
+                set_socket_timeouts(client_fd, state.install_active || state.ftp_server != NULL);
                 handle_request(client_fd, &state);
                 close(client_fd);
                 if (g_procui_exit_requested)
@@ -5580,11 +6294,13 @@ int main(int argc, char **argv)
             }
         }
 
-        if (initialized && state.title_launch_pending)
+        // A commit/cancel above may have ended FTP. Restore the power lease immediately then.
+        if (owner_control_due || !state.ftp_server) update_power_guard(&state, false);
+        if (owner_control_due && initialized && state.title_launch_pending)
             dispatch_pending_title_launch(&state);
 
         uint64_t now = OSGetTime();
-        if (now - last_heartbeat_ticks >= OSMillisecondsToTicks(5000))
+        if (owner_control_due && now - last_heartbeat_ticks >= OSMillisecondsToTicks(5000))
         {
             state.loop_heartbeat_count++;
             WHBLogPrintf(
@@ -5598,7 +6314,13 @@ int main(int argc, char **argv)
             render_assistant_screen(&state);
         }
 
-        OSSleepTicks(OSMillisecondsToTicks(25));
+        AssistantFile *sleep_file = state.ftp_entry;
+        uint64_t sleep_started = sleep_file ? OSGetTime() : 0;
+        OSSleepTicks(OSMillisecondsToTicks(state.ftp_server ? 1 : 25));
+        if (sleep_file && state.ftp_entry == sleep_file) {
+            state.ftp_sleep_ticks += OSGetTime() - sleep_started;
+            state.ftp_sleep_calls++;
+        }
     }
 
     /*
@@ -5627,6 +6349,8 @@ int main(int argc, char **argv)
         assistant_screen_shutdown();
     }
 
+    /* Restore only our runtime APD lease; keep ProcUI-owned teardown intact. */
+    update_power_guard(&state, true);
     WHBProcShutdown();
     return 0;
 }

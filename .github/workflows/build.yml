@@ -1,6 +1,12 @@
-name: Wii U build
+name: Wii U release preparation
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: Component version matching the reviewed source mapping
+        required: true
+        default: 1.0.6
+        type: string
 permissions:
   contents: read
 jobs:
@@ -9,29 +15,21 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Build SDK image
-        run: docker build -t component-builder .
-      - name: Compile
-        run: docker run --rm --network none -e GITHUB_SHA -v "$PWD:/project" -w /project component-builder make -j2 UIF_COMPONENT_BUILD_ID="$GITHUB_SHA"
-      - name: Host checks
+      - name: Verify source mapping and packaging
+        shell: pwsh
         run: |
-          docker build -f tests/Dockerfile.host -t component-tests .
-          docker run --rm --network none -v "$PWD:/app" -w /app component-tests make host-test ui-host-test
-      - name: Record source and toolchain
-        run: |
-          git rev-parse HEAD > BUILD-COMMIT.txt
-          docker image inspect component-builder > BUILD-TOOLCHAIN.json
-          sha256sum ./*.rpx ./*.wuhb > SHA256SUMS.txt
+          ./Scripts/Test-SourceMapping.ps1 -TempRoot (Join-Path $env:RUNNER_TEMP ("source-mapping-" + [Guid]::NewGuid().ToString('N')))
+          ./Scripts/Test-ReleasePreparation.ps1 -TempRoot (Join-Path $env:RUNNER_TEMP ("release-preparation-" + [Guid]::NewGuid().ToString('N')))
+      - name: Build verified binary and source packages
+        shell: pwsh
+        env:
+          UIF_COMPONENT_VERSION: ${{ inputs.version }}
+        run: ./Scripts/Build-Release.ps1 -Version $env:UIF_COMPONENT_VERSION
       - uses: actions/upload-artifact@v4
         with:
-          name: UInjectForge-Assistant-build
+          name: UInjectForge-Assistant-release-preparation
           if-no-files-found: error
           path: |
-            *.rpx
-            *.wuhb
-            BUILD-COMMIT.txt
-            BUILD-TOOLCHAIN.json
-            SHA256SUMS.txt
-            LICENSE*
-            THIRD-PARTY-NOTICES.md
-            licenses/
+            artifacts/**/UInjectForge-Assistant-*-WiiU.zip
+            artifacts/**/UInjectForge-Assistant-*-Source.zip
+            artifacts/**/SHA256SUMS.txt

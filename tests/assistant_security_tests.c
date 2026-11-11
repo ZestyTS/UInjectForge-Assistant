@@ -61,6 +61,8 @@ int main(void)
     assert(!assistant_request_allowed_during_install("DELETE", "/api/v1/transfers/abc"));
     assert(!assistant_request_allowed_during_install("GET", "/api/v1/transfers/"));
     assert(!assistant_request_allowed_during_install("GET", "/api/v1/titles"));
+    assert(!assistant_request_allowed_during_install("GET", "/api/v1/diagnostics/title-catalog/expanded"));
+    assert(!assistant_request_allowed_with_install("GET", "/api/v1/diagnostics/title-catalog/count-sized"));
     assert(!assistant_request_allowed_during_install(NULL, NULL));
     test_constant_time_compare();
     test_pairing_backoff();

@@ -4,6 +4,18 @@ Wii U companion for UInjectForge on desktop and mobile.
 Receive builds over your local network, inspect SD packages, and install
 selected titles to available system memory or USB storage.
 
+## 1.0.6 source preparation
+
+This branch prepares the newer Assistant used with UIF 1.0.6. It adds negotiated
+FTP for bulk data while HTTP handles pairing, control, verification and install
+requests. Older receivers retain the HTTP path. The published September preview
+remains a separate download until the new package completes release acceptance.
+
+Source, tests and dependency notices were synchronized from the reviewed UIF
+component; see [source mapping](UPSTREAM-SOURCE.json). The standalone release
+workflow is preserved. Final source/build identity and exact-package hardware
+checks are still required. No universal speed or completed overlap claim is made.
+
 ## Install
 
 Download the ZIP from this repository's Releases, then copy the **contents**
@@ -43,6 +55,5 @@ cannot prove those behaviors.
 - [Protocol and development reference](REFERENCE.md)
 - [License](LICENSE) and [third-party notices](THIRD-PARTY-NOTICES.md)
 
-The development reference is retained from the parent project; its old build
-hashes and parent-repository packaging command are historical, not standalone
-release instructions. Use BUILDING.md instead.
+The development reference also describes the full UIF checkout. Use BUILDING.md
+for this standalone repository's release workflow. [Pairing details](PAIRING.md).

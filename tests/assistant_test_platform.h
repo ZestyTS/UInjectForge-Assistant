@@ -23,7 +23,9 @@ typedef struct { uint16_t x, y, touched, validity; } VPADTouchData;
 typedef struct { uint32_t trigger; VPADTouchData tpNormal; } VPADStatus;
 typedef struct { uint32_t trigger; int extensionType; struct { uint32_t trigger; } classic, pro; } KPADStatus;
 typedef int MCPError;
-typedef struct { uint64_t titleId; uint32_t groupId; char path[56]; int appType;
+typedef uint32_t MCPAppType;
+typedef uint32_t MCPDeviceType;
+typedef struct __attribute__((packed)) { uint64_t titleId; uint32_t groupId; char path[56]; int appType;
     uint16_t titleVersion; uint64_t osVersion; uint32_t sdkVersion; char indexedDevice[10]; uint8_t unknown; } MCPTitleListType;
 
 #ifdef __cplusplus
@@ -39,6 +41,9 @@ MCPError MCP_Open(void);
 MCPError MCP_Close(int handle);
 MCPError MCP_TitleCount(int handle);
 MCPError MCP_TitleList(int handle, uint32_t *count, MCPTitleListType *titles, uint32_t bytes);
+MCPError MCP_TitleListByAppType(int handle, MCPAppType app_type, uint32_t *count, MCPTitleListType *titles, uint32_t bytes);
+MCPError MCP_TitleListByDeviceType(int handle, MCPDeviceType device_type, uint32_t *count, MCPTitleListType *titles, uint32_t bytes);
+MCPError MCP_TitleListByDevice(int handle, const char *device, uint32_t *count, MCPTitleListType *titles, uint32_t bytes);
 #ifdef __cplusplus
 }
 #endif
